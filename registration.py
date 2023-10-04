@@ -3,8 +3,6 @@
 """
 Provides a standardized way to register services with each other.
 
-
-
 classes:
     Scroll
         A standardized registration request message.
@@ -30,25 +28,27 @@ from dataclasses import dataclass, field
 from time import time
 from typing import Coroutine, Optional, Sequence, Mapping, TypeAlias
 
+from .fukujou import nonce
+
 logger = logging.getLogger("main.registration")
 logger.setLevel(logging.INFO)
 
 ENCODING = "utf-8"
+TTL = 60  # time-to-live for this scroll
 
 SockT: TypeAlias = zmq.Socket
 
 
-async def prepare_send_msg(self) -> bytes:
-    as_dict = {var for var in vars(self) if not var.startswith("_") and var is not None}
-    return json.dumps(as_dict).encode()
+# async def prepare_send_msg(self) -> bytes:
+#     as_dict = {var for var in vars(self) if not var.startswith("_") and var is not None}
+#     return json.dumps(as_dict).encode()
 
 
-async def send(socket: zmq.Socket) -> None:
-    await socket.send(prepare_send_msg())
+# async def send(socket: zmq.Socket) -> None:
+#     await socket.send(prepare_send_msg())
 
 
 # --------------------------------------------------------------------------------------
-# request/reply classes for standardization of registration messages
 @dataclass
 class Scroll:
     """A service description for services
@@ -60,14 +60,22 @@ class Scroll:
     name: str  # print name of the service
     service_name: str  # service name as it appears in the service description
     service_type: str  # type of the service
+
     endpoints: Mapping[str, str]  # endpoints of the service
+
     exchange: str  # exchange that is handled by the service
     markets: Sequence[str]  # markets that are handled by the service
     description: Optional[str] = None  # more detailed description of the service
+
     version: Optional[str] = None  # version number
+
     public_key: Optional[str] = None  # public key of the service
     session_key: Optional[str] = None  # current session key of the service
-    _ttl: int = field(default_factory=time)  # time-to-live for this scroll
+    certificate: Optional[bytes] = None  # current certificate of the service
+
+    nonce: Optional[bytes] = None  # nonce for this scroll
+    ttl: int = field(default_factory=time)  # time-to-live for this scroll
+
     _socket: Optional[zmq.Socket] = None  # socket for use by the send method
     _routing_key: Optional[bytes] = None  # only for replies (for ROUTER socket)!
 
@@ -89,8 +97,8 @@ class Scroll:
             raise ValueError("no socket provided!")
 
         # use provided socket & routing key, if available
-        socket = self._socket if not socket else socket
-        routing_key = self._routing_key if not routing_key else routing_key
+        socket = socket or self._socket
+        routing_key = routing_key or self._routing_key
 
         # create msg as json encoded bytes string
         msg_encoded = self.prepare_send_msg()
@@ -132,7 +140,7 @@ class Scroll:
 
         # make sure all required keys are present
         if (missing := [var for var in must_have if var not in as_dict]):
-            raise KeyError("Unable to create Scroll, missing keys: %s" % missing)
+            raise KeyError("missing keys: %s" % missing)
 
         return Scroll(
             uid=as_dict.get("uid", None),
@@ -141,7 +149,7 @@ class Scroll:
             service_type=as_dict.get("service_type", None),
             endpoints=as_dict.get("endpoints", None),
             exchange=as_dict.get("exchange", None),
-            markets=as_dict.get("market", []),
+            markets=as_dict.get("markets", []),
             description=as_dict.get("description", None),
             version=as_dict.get("version", None),
             public_key=as_dict.get("public_key", None),
@@ -155,7 +163,8 @@ class Scroll:
         Parameters
         ----------
         msg : bytes
-            A undecoded ZMQ message to create the registration request from.
+            An (undecoded) ZMQ message to create the registration request from.
+
         reply_socket : Optional[zmq.Socket]
             The socket to send the reply to.
 
@@ -171,8 +180,8 @@ class Scroll:
             msg_as_dict["_socket"] = reply_socket
 
         try:
-            return Scroll(**msg_as_dict)
-        except (IndexError, AttributeError) as e:
+            return Scroll.from_dict(msg_as_dict)
+        except KeyError as e:
             logger.exception("unable to create Scroll from: %s --> %s", msg, e)
 
 

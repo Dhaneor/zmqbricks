@@ -39,7 +39,10 @@ if __name__ == "__main__":
     logger.setLevel(logging.INFO)
 else:
     logger = logging.getLogger("main.kinsfolk")
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
+
+
+GRACE_PERIOD = 86400  # delete inactive kinsman after x seconds
 
 
 # ======================================================================================
@@ -57,6 +60,8 @@ class Kinsman:
     description: Optional[str] = None
     public_key: Optional[str] = None
     session_key: Optional[str] = None
+    certificate: Optional[str] = None
+    status: str = 'active'
     liveness: Optional[int] = 0
     last_seen: Optional[float] = 0
     last_health_check: Optional[int] = 0
@@ -75,6 +80,10 @@ class Kinsman:
 
     def __hash__(self) -> int:
         return hash(self.identity)
+
+    @property
+    def is_active(self) -> bool:
+        return self.status == 'active'
 
     @staticmethod
     def from_scroll(scroll: Scroll, initial_liveness: int) -> "Kinsman":
@@ -96,9 +105,10 @@ class Kinsman:
             markets=scroll.markets,
             description=scroll.description,
             public_key=scroll.public_key,
+            session_key=scroll.session_key,
+            certificate=scroll.certificate,
             liveness=initial_liveness,
             last_seen=now,
-            session_key=None,
             last_health_check=now,
         )
 
@@ -109,11 +119,31 @@ KinsfolkT = Mapping[str, Kinsman]  # type alias
 class Kinsfolk:
     "A registry that keeps track of connected kinsmen."
 
-    def __init__(self, hb_interval_seconds: int, hb_liveness: int) -> None:
+    def __init__(
+        self,
+        hb_interval_seconds: int,
+        hb_liveness: int,
+        on_inactive_kinsman: Optional[Coroutine] = None,
+        grace_period: int = 86400
+    ) -> None:
+        """Initialize the Kinsfolk.
+
+        Parameters
+        ----------
+        hb_interval_seconds : int
+            heartbeat interval in seconds (for health checks).
+        hb_liveness : int
+            initial liveness value (for health checks).
+        grace_period : int, optional
+            delete inactive kinsman after this period, by default 86400
+        """
         self._kinsfolk: KinsfolkT = {}
 
         self.hb_interval_seconds = hb_interval_seconds
         self.hb_liveness = hb_liveness
+        self.grace_period = grace_period
+
+        self.on_inactive_kinsman: Optional[Coroutine] = on_inactive_kinsman
 
     def __contains__(self, identity: str) -> bool:
         return identity in self._kinsfolk
@@ -133,9 +163,33 @@ class Kinsfolk:
     def __len__(self) -> int:
         return len(self._kinsfolk)
 
+    @property
+    def active_kinsmen(self) -> KinsfolkT:
+        return {
+            identity: kinsman
+            for identity, kinsman in self._kinsfolk.items()
+            if kinsman.is_active
+        }
+
     # .................................................................................
     async def watch_out(self, actions: Optional[Sequence[Coroutine]] = None) -> None:
-        """Watches over the health of the Kinsfolk"""
+        """Watch over the health of the Kinsfolk.
+
+        NOTE: This is a blocking call and should be run as a task!
+
+        This coroutine will watch over the health of the Kinsfolk,
+        roughly after every heartbeat interval (instance attribute).
+        If we did not receive a heartbeat, the 'liveness' attribute will
+        be decreased by 1. When it reches 0, the kinsman´s status will
+        be set to 'inactive'. Inactive kinsmen will be deleted from the
+        Kinsfolk after the grace period (also instance attribute,
+        defaults to 24h).
+
+        Parameters
+        ----------
+        actions: Sequence[Coroutine], optional
+            actions to be executed in case we have no more kinsman left
+        """
         logger.debug("watching out ...")
 
         while True:
@@ -145,11 +199,12 @@ class Kinsfolk:
                 if self._kinsfolk:
                     self.check_health()
 
-                # execute provide actions in case we have no more kinsman left
-                if not self._kinsfolk and actions:
+                # execute provided actions in case we have no more kinsman left
+                if not self.active_kinsmen and actions:
                     for action in actions:
                         logger.debug("executing action %s", action)
                         await action()
+
             except asyncio.CancelledError:
                 logger.debug("watch out task cancelled ...")
                 break
@@ -166,16 +221,41 @@ class Kinsfolk:
         """Adds a new Kinsman to the Kinsfolk"""
         self._kinsfolk[kinsman.identity] = kinsman
 
-    async def update(self, identity: str, *args) -> None:
-        """Updates the health for the Kinsman with the given identity-"""
-        if identity in self._kinsfolk:
-            self._kinsfolk[identity].last_seen = time.time()
-            self._kinsfolk[identity].liveness = self.hb_liveness
+    async def update(
+        self,
+        identity: str,
+        payload: dict = None,
+        on_missing: Coroutine = None
+    ) -> None:
+        """Updates the health for the Kinsman with the given identity.
+
+        Parameters
+        ----------
+        identity: str
+            identity of the kinsman to update
+
+        on_missing: Coroutine
+            call this if the identity is unknown, should expect to receive
+            the identity as an argument
+        """
+        kinsman = self._kinsfolk.get(identity, None)
+
+        if kinsman:
+            kinsman.last_seen, kinsman.liveness = time.time(), self.hb_liveness
             logger.debug("'HOY!' from %s", self._kinsfolk[identity])
+            # if the kinsman's status is set to "inactive", re-activate it
+            if kinsman.status != 'active':
+                logger.info("... re-activating inactive kinsman")
+                kinsman.status = 'active'
+                kinsman.last_seen = time.time()
+                kinsman.last_health_check = time.time()
+                kinsman.liveness = self.hb_liveness
         else:
             logger.warning(
                 "Kinsman %s not found in Kinsfolk -> %s", identity, self._kinsfolk
             )
+            if on_missing:
+                await on_missing(identity)
 
     async def accept(self, scroll: Scroll) -> bool:
         """Accepts a new Kinsman to the Kinsfolk
@@ -220,19 +300,28 @@ class Kinsfolk:
         now = time.time()
 
         self._kinsfolk = {
-            id: kinsman
-            for id, kinsman in self._kinsfolk.items()
-            if self._is_alive(kinsman, now)
+            identity: kinsman
+            for identity, kinsman in self._kinsfolk.items()
+            if (self._is_alive(kinsman, now)) or (kinsman.status == "inactive")
         }
 
     def _is_alive(self, kinsman: Kinsman, now: int) -> bool:
-        if now - kinsman.last_seen < self.hb_interval_seconds:
+        # well, he/she is alive, healthy, and sent a hb message in timely manner
+        if kinsman.is_active and (now - kinsman.last_seen < self.hb_interval_seconds):
             return True
 
+        # don't consider him to be dead when his status is "inactive",
+        # but do so, if the time he hasn't been seen exceeds the grace period
+        if not kinsman.is_active:
+            return (
+                True if time.time() - kinsman.last_seen < self.grace_period else False
+            )
+
+        # well, he/she is alive, but did not send a heartbeat fast enough
         kinsman.liveness -= 1
         kinsman.last_seen = now
 
-        logger.info(
+        logger.debug(
             "kinsman %s´s health is degrading: %s", kinsman.name, kinsman.liveness
         )
 
@@ -243,5 +332,8 @@ class Kinsfolk:
         logger.warning(
             "Thy shall mourn the passing of our kinsman  %s!", kinsman.name
         )
+
+        if self.on_inactive_kinsman:
+            asyncio.create_task(self.on_inactive_kinsman(kinsman=kinsman))
 
         return False

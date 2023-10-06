@@ -66,7 +66,7 @@ parent = os.path.dirname(current)
 sys.path.append(parent)
 # --------------------------------------------------------------------------------------
 
-from zmqbricks.building_blocks.async_timer_with_reset import create_timer  # noqa: F401, E402
+from zmqbricks.util.async_timer_with_reset import create_timer  # noqa: F401, E402
 
 logger = logging.getLogger("main.heartbeat")
 logger.setLevel(logging.INFO)
@@ -278,15 +278,13 @@ async def send_hb(
         The name of the sender.
 
     payload: Optional[PayloadT]
-        Additional payload to send with the heartbeat message.
+        Additional payload to send with the heartbeat message, if required.
     """
     if asyncio.iscoroutinefunction(payload):
         logger.debug("getting payload from coroutine ...")
         payload = await payload()
 
     hb_msg = HeartbeatMessage(uid, name, socket, payload=payload or {})
-
-    # logger.debug("sending hb msg %s", hb_msg)
 
     try:
         await hb_msg.send()

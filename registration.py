@@ -24,28 +24,63 @@ import json
 import logging
 import zmq
 
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 from time import time
-from typing import Coroutine, Optional, Sequence, Mapping, TypeAlias
+from typing import Coroutine, Optional, Sequence, Mapping, TypeAlias, Callable, Any
 
-from .fukujou import nonce
+from .fukujou.nonce import Nonce
+from .fukujou.curve import generate_curve_key_pair
 
 logger = logging.getLogger("main.registration")
 logger.setLevel(logging.INFO)
 
+
+DEFAULT_RGSTR_TIMEOUT = 10  # seconds
+DEFAULT_RGSTR_LOG_INTERVAL = 900  # resend request after (secs)
+DEFAULT_RGSTR_MAX_ERRORS = 10  # maximum number of registration errors
+
 ENCODING = "utf-8"
-TTL = 60  # time-to-live for this scroll
+TTL = 5  # time-to-live for this scroll (seconds)
+MAX_LEN_NONCE_CACHE = 1000  # how many nonces to store for comparison
+
 
 SockT: TypeAlias = zmq.Socket
+ConfigT: TypeAlias = object
+ContextT: TypeAlias = zmq.asyncio.Context
 
 
-# async def prepare_send_msg(self) -> bytes:
-#     as_dict = {var for var in vars(self) if not var.startswith("_") and var is not None}
-#     return json.dumps(as_dict).encode()
+# ======================================================================================
+def get_ttl():
+    return int(time() + TTL)
 
 
-# async def send(socket: zmq.Socket) -> None:
-#     await socket.send(prepare_send_msg())
+class MissingTtlError(BaseException):
+    ...
+
+
+class ExpiredTtlError(BaseException):
+    ...
+
+
+class MissingNonceError(BaseException):
+    ...
+
+
+class DuplicateNonceError(BaseException):
+    ...
+
+
+class EmptyMessageError(BaseException):
+    ...
+
+
+class RegistrationError(BaseException):
+    pass
+
+
+class MaxRetriesReached(RegistrationError):
+    pass
 
 
 # --------------------------------------------------------------------------------------
@@ -73,19 +108,28 @@ class Scroll:
     session_key: Optional[str] = None  # current session key of the service
     certificate: Optional[bytes] = None  # current certificate of the service
 
-    nonce: Optional[bytes] = None  # nonce for this scroll
-    ttl: int = field(default_factory=time)  # time-to-live for this scroll
+    nonce: Optional[bytes] = None  # unique nonce
+    ttl: int = 0  # time-to-live for this scroll
 
     _socket: Optional[zmq.Socket] = None  # socket for use by the send method
     _routing_key: Optional[bytes] = None  # only for replies (for ROUTER socket)!
 
+    def __eq__(self, other) -> bool:
+        return all(
+            arg for arg in (
+                getattr(self, var) == getattr(other, var)
+                for var in vars(self) if not var.startswith("_")
+            )
+        )
+
+    @property
+    def expired(self) -> bool:
+        return time() > self.ttl
+
     def prepare_send_msg(self) -> bytes:
-        as_dict = {
-            var: getattr(self, var)
-            for var in vars(self)
-            if not var.startswith("_")  # and getattr(self, var) is not None
+        return {
+            var: getattr(self, var) for var in vars(self) if not var.startswith("_")
         }
-        return json.dumps(as_dict).encode()
 
     async def send(
         self,
@@ -94,21 +138,25 @@ class Scroll:
     ) -> None:
         # make sure we have a socket
         if not socket and not self._socket:
-            raise ValueError("no socket provided!")
+            raise ValueError("we cannot send without a socket, can we?!")
 
         # use provided socket & routing key, if available
         socket = socket or self._socket
         routing_key = routing_key or self._routing_key
 
         # create msg as json encoded bytes string
-        msg_encoded = self.prepare_send_msg()
+        as_dict = self.prepare_send_msg()
+        as_dict["nonce"] = Nonce.get_nonce()
+        as_dict['ttl'] = time() + TTL
+
+        msg_encoded = json.dumps(as_dict).encode()
+
+        logger.debug("sending scroll: %s", msg_encoded)
 
         # send it (with routing key if socket is a ROUTER socket)
         if not routing_key:
-            logger.debug("no routing key provided, sending message")
             await socket.send(msg_encoded)
         else:
-            logger.debug("routing key provided, sending message with routing key")
             await socket.send_multipart([routing_key, msg_encoded])
 
     # ..................................................................................
@@ -125,6 +173,11 @@ class Scroll:
         -------
         Scroll
             The registration request created from the dictionary.
+
+        Raises
+        ------
+        KeyError
+            for missing keys/fields in the dictionary.
         """
         # the easy way ...
         try:
@@ -154,11 +207,14 @@ class Scroll:
             version=as_dict.get("version", None),
             public_key=as_dict.get("public_key", None),
             session_key=as_dict.get("session_key", None),
+            certificate=as_dict.get("certificate", None),
+            nonce=as_dict.get("nonce", None),
+            ttl=as_dict.get("ttl", None),
         )
 
     @staticmethod
     def from_msg(msg: bytes, reply_socket: Optional[zmq.Socket] = None) -> "Scroll":
-        """(Re-)Create a registration request from a message.
+        """(Re-)Create a registration request from a ZeroMQ message.
 
         Parameters
         ----------
@@ -185,64 +241,247 @@ class Scroll:
             logger.exception("unable to create Scroll from: %s --> %s", msg, e)
 
 
-@dataclass(frozen=True)
-class RegistrationReply:
-    """Represents a registration response for services"""
+# --------------------------------------------------------------------------------------
+def check_nonce(request, nonces):
+    """Check if a nonce is valid.
 
-    uid: str
-    name: str
-    service_name: Optional[str] = None
-    service_type: Optional[str] = None
-    endpoints: Optional[Mapping[str, SockT]] = None
-    exchange: Optional[str] = None
-    market: Optional[str] = None
-    description: Optional[str] = None
-    command: Optional[str] = None
-    reply: Optional[str] = 'OK'
-    comment: Optional[str] = None
-    public_key: Optional[str] = None
-    session_key: Optional[str] = None
+    Parameters
+    ----------
+    nonce : bytes
+        The nonce to check.
 
-    def prepare_send_msg(self) -> bytes:
-        as_dict = {
-            var: getattr(self, var)
-            for var in vars(self)
-            if not var.startswith("_")
-        }
+    nonces : Sequence[bytes]
+        The list of nonces to check against.
 
-        logger.debug(as_dict)
+    Raises
+    ------
+    MissingNonceError
+        Raised if the request does not contain a nonce.
 
-        return json.dumps(as_dict).encode()
+    DuplicateNonceError
+        Raised if the request contains a nonce that was already used.
+    """
+    if not request.nonce:
+        raise MissingNonceError(
+            f"{request.name} sent no nonce. message ignored"
+        )
 
-    async def send(
-        self,
-        socket: zmq.Socket,
-        routing_key: Optional[bytes] = None
-    ) -> None:
-        if routing_key is not None:
-            try:
-                await socket.send_multipart([routing_key, self.prepare_send_msg()])
-            except Exception as e:
-                logger.exception("unable to send registration reply: %s", e)
-        else:
-            await socket.send(self.prepare_send_msg())
+    if request.nonce in nonces:
+        raise DuplicateNonceError(
+            f"{request.name} reused a nonce. message ignored"
+        )
 
-    @staticmethod
-    def from_dict(as_dict: dict) -> "Scroll":
+    nonces.append(request.nonce)
+
+
+def check_ttl(request):
+    """Check if a TTL is valid.
+
+    Parameters
+    ----------
+    request : Scroll
+        The scroll to check.
+
+    Raises
+    ------
+    MissingTtlError
+        Raised if the request does not contain a TTL.
+
+    DuplicateTtlError
+        Raised if the request contains a TTL that was already used.
+    """
+    if not request.ttl:
+        raise MissingTtlError(
+            f"{request.name}´s scroll has no TTL. message ignored"
+        )
+
+    if request.expired:
+        raise ExpiredTtlError(
+            f"{request.name}´ scroll TTL expired. message ignored"
+        )
+
+
+# --------------------------------------------------------------------------------------
+async def call_them_callbacks(actions: Sequence[Coroutine], payload: Any) -> None:
+    for action in actions:
         try:
-            return RegistrationReply(**as_dict)
-        except KeyError as e:
-            logger.error(
-                "unable to create registration request from: %s --> %s", as_dict, e
-            )
-        except TypeError as e:
-            logger.error(
-                "unable to create registration request from: %s --> %s", as_dict, e
-            )
+            await action(payload)
         except Exception as e:
-            logger.exception("unexpected error: %s --> %s", as_dict, e)
+            logger.critical("action failed: %s", action, exc_info=1)
+            raise Exception() from e
 
-        return None
+
+async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> dict:
+    """Attempts to register with a specific peer.
+
+    Parameters
+    ----------
+    ctx : ContextT
+        the current ZeroMQ context
+    scroll : Scroll
+        service description for local/calling service
+    peer_scroll : Scroll
+        service description for the peer
+
+    Returns
+    -------
+    dict
+        registration response from peer, if successful
+
+    Raises
+    ------
+    MaxRetriesReached
+        raises after more than DEFAULT_RGSTR_MAX_ERRORS errors/timeouts
+    """
+
+    # prepare variables
+    response, registered, errors, last_log = None, False, 0, time()
+    public_key, private_key = generate_curve_key_pair()
+
+    # good luck!
+    while not registered:
+        now = time()
+        log_it = now > last_log + DEFAULT_RGSTR_LOG_INTERVAL
+
+        # exponential backoff for exceptions, not used if collector is
+        # just unreachable because it could be back at any moment, and
+        # ... the show must go on!
+        time_out_after_error = TTL + 2 ** errors
+
+        # NOTE: We need to consider the possibility that collctor is
+        #       offline/unreachable. But we also don't want to wait
+        #       forever for a response. Therefore we will use a
+        #       timeout, but that means that the socket needs to be
+        #       a one-time socket that is recreated for every attempt.
+        #       Otherwise, requests would pile up in the local queue,
+        #       and collector would receive duplicate messages (also
+        #       with expired TTL).
+        #       I tried different socket options, but couldn't find a
+        #       better way to do this. But maybe there is one ...?!
+
+        # send the registration request
+        if log_it:
+            logger.info("... sending registration request ...")
+            logger.debug("...config: %s", peer_scroll)
+            last_log = now
+
+        with zmq.asyncio.Socket(ctx, zmq.DEALER) as sock:
+            # configure socket & connection encryption
+            sock.setsockopt(zmq.LINGER, TTL)
+            sock.curve_secretkey = private_key.encode("ascii")
+            sock.curve_publickey = public_key.encode("ascii")
+            sock.curve_serverkey = peer_scroll.public_key.encode("ascii")
+            sock.connect(peer_scroll.endpoint)
+
+            # send the request
+            await scroll.send(sock)
+
+            # ... & wait for an answer, retry if necessary
+            try:
+                response = await asyncio.wait_for(sock.recv_json(), TTL)
+
+            except asyncio.TimeoutError:
+                # don't log it every time
+                if log_it:
+                    logger.warning(
+                        "... collector unreachable, but I won't give up easily"
+                    )
+                errors += 1
+
+            except zmq.ZMQError as e:
+                logger.error(f"ZMQ error: {e} for {scroll}")
+                logger.info("will try again in %s seconds...", time_out_after_error)
+                await asyncio.sleep(time_out_after_error)
+                errors += 1
+
+            except Exception as e:
+                logger.error(f"unexpected error: {e} for: {scroll}", ecx_info=1)
+                logger.info("will try again in %s seconds...", time_out_after_error)
+                await asyncio.sleep(time_out_after_error)
+                errors += 1
+
+            else:
+                logger.debug(f"received reply from collector: {response}")
+                registered = True
+
+            finally:
+                if not response and errors > DEFAULT_RGSTR_MAX_ERRORS:
+                    raise MaxRetriesReached(
+                        "unable to register with collector %s after %s errors",
+                        peer_scroll.endpoint, DEFAULT_RGSTR_MAX_ERRORS
+                    )
+
+    return response
+
+
+async def register(
+    ctx: ContextT,
+    config: ConfigT,
+    rgstr_info_fn: Callable,
+    actions: Optional[Sequence[Coroutine]] = None
+) -> Scroll:
+    """Register with a peer kinsman.
+
+    Parameters
+    ----------
+    ctx : zmq.Context
+        the current ZMQ context
+
+    config : ConfigT
+        this streamers configuration object
+
+    rgstr_info_fn : Callable
+        a function that return the registration information.
+
+    actions : Optional[Sequence[Coroutine]], optional
+        coroutines to call after successful registration, default None
+
+    Returns
+    -------
+    Scroll
+        registration reply
+
+    Raises
+    ------
+    RegistrationError
+        if the registration for all possible peers failed
+    """
+    logger.info("... registering with collector at %s", config.publisher_addr)
+
+    # build formalized registration request
+    scroll = Scroll.from_dict(config.as_dict())
+    registered = False
+
+    while not registered:
+
+        while not (peer_scroll := rgstr_info_fn()):
+            asyncio.sleep(10)
+
+        try:
+            response = await _get_response(ctx, scroll, peer_scroll)
+        except MaxRetriesReached as e:
+            logger.error(e)
+            raise RegistrationError("registration: FAIL") from e
+        else:
+            registered = True
+
+            # build formalized registration reply from dictionary response
+            try:
+                scroll = Scroll.from_dict(response)
+            except (KeyError, AttributeError) as e:
+                logger.critical(
+                    "invalid reply from collector: %s", response, exc_info=1
+                )
+                raise RegistrationError("registration: FAIL") from e
+
+            # execute  provided actions with reply, if any
+            if actions:
+                await call_them_callbacks(actions, scroll)
+
+            logger.info("===================================================")
+            logger.info("registered with collector at %s", config.register_at)
+
+    return scroll
 
 
 # --------------------------------------------------------------------------------------
@@ -256,29 +495,43 @@ async def monitor_registration(
     Parameters
     ----------
     socket : zmq.Socket
-        A ZMQ socket, preferably a ROUTER socket.
+        A ZMQ ready-to-use socket, preferably a ROUTER socket.
+
     callbacks : Optional[Sequence[Coroutine]]
-        callback coroutines that can process registration requests.
+        callback coroutine(s) that can process registration requests.
+
     queues : Optional[Sequence[asyncio.queues.Queue]]
-        ZMQ queues for sending registration requests.
+        asyncio queue(s) for sending registration requests.
     """
     logger.info("registration monitor started: OK")
+
+    nonces = deque(maxlen=MAX_LEN_NONCE_CACHE)
 
     while True:
         try:
             msg_bytes = await socket.recv_multipart()
+
+            if len(msg_bytes) == 2 and msg_bytes[1] == b"":
+                raise EmptyMessageError()
+
             request = Scroll.from_msg(msg_bytes, socket)
 
             logger.info(
                 "registration request from %s for %s",
                 request.name,
-                request.service_name
+                request.service_name,
             )
 
+            # check nonce & TTL of the request
+            check_nonce(request, nonces)
+            check_ttl(request)
+
+            # perform callbacks for valid request
             if callbacks:
                 for callback in callbacks:
                     await callback(request)
 
+            # send to queue(s) for valid request
             if queues:
                 for queue in queues:
                     queue.put_nowait(request)
@@ -287,12 +540,21 @@ async def monitor_registration(
 
         except zmq.ZMQError as e:
             logger.error("registration monitor -> zmq error: %s", e)
+        except EmptyMessageError:
+            # can happen when clients need to wait the receiver
+            # to come back online ... not important
+            pass
         except UnicodeDecodeError as e:
             logger.error("unicode decode error: %s", e)
+        except (MissingTtlError, ExpiredTtlError) as e:
+            logger.error(e)
+        except (MissingNonceError, DuplicateNonceError) as e:
+            logger.error(e)
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.exception("unexpected error: %s", e)
+            logger.error("exception caused by this msg: %s", msg_bytes)
 
     logger.info("registration monitor stopped: OK")
 
@@ -304,7 +566,7 @@ if __name__ == "__main__":
         "endpoints": {},
         "uid": "39f531e5-763b-4a1b-863d-b0b548542267",
         "exchange": "kucoin",
-        "market": "spot",
+        "markets": ["spot"],
         "desc": "",
         "external_ip": "192.168.1.1",
         "name": "Daireann Seamus X.",

@@ -495,7 +495,7 @@ async def monitor_registration(
     Parameters
     ----------
     socket : zmq.Socket
-        A ZMQ ready-to-use socket, preferably a ROUTER socket.
+        A ready-to-use ZMQ ROUTER socket.
 
     callbacks : Optional[Sequence[Coroutine]]
         callback coroutine(s) that can process registration requests.
@@ -516,11 +516,7 @@ async def monitor_registration(
 
             request = Scroll.from_msg(msg_bytes, socket)
 
-            logger.info(
-                "registration request from %s for %s",
-                request.name,
-                request.service_name,
-            )
+            logger.info("rgstr req: %s -  %s", request.name, request.service_name)
 
             # check nonce & TTL of the request
             check_nonce(request, nonces)

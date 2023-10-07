@@ -337,3 +337,5 @@ class Kinsfolk:
             asyncio.create_task(self.on_inactive_kinsman(kinsman=kinsman))
 
         return False
+
+

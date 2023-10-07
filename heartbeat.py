@@ -395,6 +395,14 @@ async def start_hb_recv_task(
     return asyncio.create_task(recv_hb(socket, actions, queues, latency_tracker))
 
 
+# ======================================================================================
+#                                  HEARTBEAT OOP STYLE                                 #
+# ======================================================================================
+class Herta:
+
+    def __init__(self, config: configT):
+        ...
+
 
 
 

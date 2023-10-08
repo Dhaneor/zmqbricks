@@ -170,7 +170,7 @@ async def test_rawi():
     def get_rgstr_info():
 
         class C:
-            endpoint = "tcp://127.0.0.1:11000"
+            endpoints = {"registration": "tcp://127.0.0.1:11000"}
             public_key = cnf_srv.public_key
 
             def __repr__(self):

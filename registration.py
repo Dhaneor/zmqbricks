@@ -27,12 +27,15 @@ import zmq
 from collections import deque
 from dataclasses import dataclass
 from time import time
-from typing import Coroutine, Optional, Sequence, Mapping, TypeAlias, Callable, Any
+from typing import (
+    Coroutine, Optional, Sequence, Mapping, TypeAlias, Callable, Any, TypeVar
+)
 
-from fukujou.nonce import Nonce
-from fukujou.curve import generate_curve_key_pair
-from base_config import ConfigT
-from exceptions import (
+# from zmqbricks.kinsfolk import KinsfolkT
+from zmqbricks.fukujou.nonce import Nonce
+from zmqbricks.fukujou.curve import generate_curve_key_pair
+from zmqbricks.base_config import ConfigT
+from zmqbricks.exceptions import (
     MissingTtlError,
     ExpiredTtlError,
     MissingNonceError,
@@ -55,6 +58,7 @@ TTL = 5  # time-to-live for a scroll (seconds)
 MAX_LEN_NONCE_CACHE = 1000  # how many nonces to store for comparison
 
 
+KinsfolkT = TypeVar("KinsfolkT", bound=Mapping[str, str])
 SockT: TypeAlias = zmq.Socket
 # ConfigT: TypeAlias = object
 ContextT: TypeAlias = zmq.asyncio.Context
@@ -304,8 +308,10 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
     ----------
     ctx : ContextT
         the current ZeroMQ context
+
     scroll : Scroll
         service description for local/calling service
+
     peer_scroll : Scroll
         service description for the peer
 
@@ -316,6 +322,8 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
 
     Raises
     ------
+    ValueError
+        if the provided scroll has no registration endpoint
     MaxRetriesReached
         raises after more than DEFAULT_RGSTR_MAX_ERRORS errors/timeouts
     """
@@ -323,6 +331,12 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
     # prepare variables
     response, registered, errors, last_log = None, False, 0, time()
     public_key, private_key = generate_curve_key_pair()
+    rgstr_endpoint = peer_scroll.endpoints.get("registration", None)
+
+    if not rgstr_endpoint:
+        raise ValueError(
+            f"no registration endpoint found for {peer_scroll.service_name}"
+        )
 
     # good luck!
     while not registered:
@@ -357,7 +371,7 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
             sock.curve_secretkey = private_key.encode("ascii")
             sock.curve_publickey = public_key.encode("ascii")
             sock.curve_serverkey = peer_scroll.public_key.encode("ascii")
-            sock.connect(peer_scroll.endpoint)
+            sock.connect(rgstr_endpoint)
 
             # send the request
             await scroll.send(sock)
@@ -394,7 +408,7 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
                 if not response and errors > DEFAULT_RGSTR_MAX_ERRORS:
                     raise MaxRetriesReached(
                         "unable to register with collector {} after {} errors"
-                        .format(peer_scroll.endpoint, DEFAULT_RGSTR_MAX_ERRORS)
+                        .format(rgstr_endpoint, DEFAULT_RGSTR_MAX_ERRORS)
                     )
 
     return response
@@ -432,7 +446,6 @@ async def register(
     RegistrationError
         if the registration for all possible peers failed
     """
-    logger.info("... registering with collector at %s", config.publisher_addr)
 
     # build formalized registration request
     scroll = Scroll.from_dict(config.as_dict())
@@ -443,8 +456,16 @@ async def register(
         while not (peer_scroll := rgstr_info_fn()):
             asyncio.sleep(10)
 
+        logger.info(
+            "... registering with collector at %s",
+            peer_scroll.endpoints.get("registration")
+        )
+
         try:
             response = await _get_response(ctx, scroll, peer_scroll)
+        except ValueError as e:
+            logger.error(e)
+            await asyncio.sleep(5)
         except MaxRetriesReached as e:
             logger.error(e)
             # raise RegistrationError("registration: FAIL") from e
@@ -468,6 +489,19 @@ async def register(
             logger.info("registered with collector at %s", config.register_at)
 
     return scroll
+
+
+async def process_registration(
+    req: Scroll,
+    config: ConfigT,
+    kinsfolk: KinsfolkT
+):
+    if not await kinsfolk.accept(req):
+        return
+
+    reply = Scroll.from_dict(config.as_dict())
+
+    await reply.send(socket=req._socket, routing_key=req._routing_key)
 
 
 # --------------------------------------------------------------------------------------

@@ -23,7 +23,7 @@ import logging
 import time
 
 from dataclasses import dataclass
-from typing import Optional, Mapping, Sequence, Coroutine
+from typing import Optional, Mapping, Sequence, Coroutine, TypeVar
 
 from .registration import Scroll
 
@@ -113,9 +113,6 @@ class Kinsman:
         )
 
 
-KinsfolkT = Mapping[str, Kinsman]  # type alias
-
-
 class Kinsfolk:
     "A registry that keeps track of connected kinsmen."
 
@@ -157,14 +154,14 @@ class Kinsfolk:
     def __delitem__(self, identity: str) -> None:
         del self._kinsfolk[identity]
 
-    def __iter__(self) -> KinsfolkT:
+    def __iter__(self) -> "Kinsfolk":
         return iter(self._kinsfolk)
 
     def __len__(self) -> int:
         return len(self._kinsfolk)
 
     @property
-    def active_kinsmen(self) -> KinsfolkT:
+    def active_kinsmen(self) -> "Kinsfolk":
         return {
             identity: kinsman
             for identity, kinsman in self._kinsfolk.items()
@@ -213,7 +210,7 @@ class Kinsfolk:
 
         logger.debug("watching out done")
 
-    async def get_all(self, service_type: str) -> KinsfolkT:
+    async def get_all(self, service_type: str) -> "Kinsfolk":
         return [k for k in self._kinsfolk.values() if k.service_type == service_type]
 
     # .................................................................................
@@ -339,3 +336,4 @@ class Kinsfolk:
         return False
 
 
+KinsfolkT = TypeVar("KinsfolkT", bound=Kinsfolk)

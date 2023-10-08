@@ -51,8 +51,6 @@ Created on Tue Sep 12 19:41:23 2023
 import asyncio
 import json
 import logging
-# import os
-# import sys
 import time
 import zmq
 import zmq.asyncio
@@ -61,8 +59,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Optional, Sequence, Callable, Mapping, Any, TypeVar, Coroutine
 
-from base_config import BaseConfig, ConfigT  # noqa: F401, E402
-from util.async_timer_with_reset import create_timer  # noqa: F401, E402
+from zmqbricks.base_config import ConfigT  # noqa: F401, E402
+from zmqbricks.util.async_timer_with_reset import create_timer  # noqa: F401, E402
 
 logger = logging.getLogger("main.heartbeat")
 logger.setLevel(logging.DEBUG)

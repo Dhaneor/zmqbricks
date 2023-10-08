@@ -114,23 +114,30 @@ class Gond:
         scroll : rgstr.Scroll
             Scroll instance containing the peer information.
         """
-        logger.info("processing registration: %s", scroll)
+        logger.info(
+            "processing registration for %s, %s", scroll.name, scroll.service_type
+        )
 
         try:
             if await self.kinsfolk.accept(scroll):
                 await self.heart.listen_to(scroll.endpoints.get("heartbeat", None))
             error = None
+
         except exc.BadScrollError as e:
             logger.error("bad scroll: %s -> %s", scroll, e)
             error = "bad scroll"
+
         except KeyError as e:
-            logger.error("scroll gave us no valid endpoint: %s -> %s", scroll, e)
+            logger.error("no heartbeat endpoint in scroll: %s -> %s", scroll, e)
             error = "bad heartbeat endpoint"
+
         except zmq.ZMQError as e:
             logger.error("ZMQ error while connecting to endpoint: %s", e)
+
         except Exception as e:
             logger.error("unexpected error: %s", e, exc_info=1)
             error = f"unexpected error: {e}"
+
         finally:
             if not reply:
                 logger.debug("not replying to %s", scroll.name)

@@ -63,7 +63,7 @@ from zmqbricks.base_config import ConfigT  # noqa: F401, E402
 from zmqbricks.util.async_timer_with_reset import create_timer  # noqa: F401, E402
 
 logger = logging.getLogger("main.heartbeat")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 # constants

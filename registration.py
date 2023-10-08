@@ -29,13 +29,21 @@ from dataclasses import dataclass
 from time import time
 from typing import Coroutine, Optional, Sequence, Mapping, TypeAlias, Callable, Any
 
-from .fukujou.nonce import Nonce
-from .fukujou.curve import generate_curve_key_pair
-from .base_config import BaseConfig
+from fukujou.nonce import Nonce
+from fukujou.curve import generate_curve_key_pair
+from base_config import ConfigT
+from exceptions import (
+    MissingTtlError,
+    ExpiredTtlError,
+    MissingNonceError,
+    DuplicateNonceError,
+    EmptyMessageError,
+    RegistrationError,
+    MaxRetriesReached,
+)
 
-logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("main.registration")
-# logger.setLevel(logging.INFO)
+logger.setLevel(logging.INFO)
 
 
 DEFAULT_RGSTR_TIMEOUT = 10  # seconds
@@ -43,12 +51,12 @@ DEFAULT_RGSTR_LOG_INTERVAL = 900  # resend request after (secs)
 DEFAULT_RGSTR_MAX_ERRORS = 10  # maximum number of registration errors
 
 ENCODING = "utf-8"
-TTL = 5  # time-to-live for this scroll (seconds)
+TTL = 5  # time-to-live for a scroll (seconds)
 MAX_LEN_NONCE_CACHE = 1000  # how many nonces to store for comparison
 
 
 SockT: TypeAlias = zmq.Socket
-ConfigT: TypeAlias = object
+# ConfigT: TypeAlias = object
 ContextT: TypeAlias = zmq.asyncio.Context
 
 
@@ -59,34 +67,6 @@ def exception_handler(loop, context):
 
 def get_ttl():
     return int(time() + TTL)
-
-
-class MissingTtlError(BaseException):
-    ...
-
-
-class ExpiredTtlError(BaseException):
-    ...
-
-
-class MissingNonceError(BaseException):
-    ...
-
-
-class DuplicateNonceError(BaseException):
-    ...
-
-
-class EmptyMessageError(BaseException):
-    ...
-
-
-class RegistrationError(BaseException):
-    pass
-
-
-class MaxRetriesReached(RegistrationError):
-    pass
 
 
 # --------------------------------------------------------------------------------------
@@ -633,87 +613,3 @@ class Rawi:
             self.monitor_task.cancel()
 
         del self
-
-
-# ======================================================================================
-async def test_rawi():
-    ctx = zmq.asyncio.Context()
-
-    loop = asyncio.get_event_loop()
-    loop.set_exception_handler(exception_handler)
-
-    async def log(x):
-        logger.debug(x)
-        await asyncio.sleep(1)
-
-    # prepare a configuration for our test server
-    class Server(BaseConfig):
-
-        def __init__(self):
-            super().__init__()
-            self.name = "server"
-            self.service_type = 'collector'
-            self.exchange = "kucoin"
-            self.actions = []
-            self.queues = []
-            self.latency_tracker = None
-            self._endpoints = {
-                "registration": "tcp://*:11000",
-                "publisher": "tcp://127.0.0:5556"
-            }
-            self.publisher_addr = self._endpoints["publisher"]
-
-    # prepare a configuration for our test client
-    class Client(BaseConfig):
-
-        def __init__(self):
-            super().__init__()
-            self.name = "client"
-            self.service_type = 'streamer'
-            self.exchange = "kucoin"
-            self.actions = []
-            self.queues = []
-            self.latency_tracker = None
-            self._endpoints = {
-                "registration": "tcp://*:5560",
-                "publisher": "tcp://127.0.0:5561"
-            }
-            self.publisher_addr = self._endpoints["publisher"]
-            self._rgstr_max_errors = 1
-
-    cnf_srv = Server()
-    cnf_cli = Client()
-
-    # define a function that returns the registration information
-    def get_rgstr_info():
-
-        class C:
-            endpoint = "tcp://127.0.0.1:11000"
-            public_key = cnf_srv.public_key
-
-            def __repr__(self):
-                return f"C(endpoint={self.endpoint}, public_key={self.public_key})"
-
-        return C()
-
-    logger.info("server config: %s", cnf_srv.as_dict())
-    logger.info("client config: %s", cnf_cli.as_dict())
-    logger.info("registration info: %s", get_rgstr_info())
-
-    # start the Rawi instance
-    server = Rawi(ctx, cnf_srv, get_rgstr_info, [log])
-    client = Rawi(ctx, cnf_cli, get_rgstr_info, [log])
-
-    # try registering with the Rawi instance
-    await server.start()
-    await asyncio.sleep(1)
-    try:
-        await client.register()
-    except RegistrationError as e:
-        logger.error(e)
-    await asyncio.sleep(2)
-    await client.stop()
-    await server.stop()
-
-if __name__ == "__main__":
-    asyncio.run(test_rawi())

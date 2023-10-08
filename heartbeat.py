@@ -51,8 +51,8 @@ Created on Tue Sep 12 19:41:23 2023
 import asyncio
 import json
 import logging
-import os
-import sys
+# import os
+# import sys
 import time
 import zmq
 import zmq.asyncio
@@ -61,18 +61,11 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Optional, Sequence, Callable, Mapping, Any, TypeVar, Coroutine
 
-# --------------------------------------------------------------------------------------
-current = os.path.dirname(os.path.realpath(__file__))
-parent = os.path.dirname(current)
-sys.path.append(parent)
-# --------------------------------------------------------------------------------------
-
 from base_config import BaseConfig, ConfigT  # noqa: F401, E402
 from util.async_timer_with_reset import create_timer  # noqa: F401, E402
 
-# logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("main.heartbeat")
-# logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.DEBUG)
 
 
 # constants
@@ -433,10 +426,10 @@ class Hjarta:
         self.on_snd: list[Coroutine] = []
         self.on_rcv: list[Coroutine] = []
 
-        logger.debug("Hjarta initialized: OK")
+        logger.info("Hjarta initialized: OK")
 
     async def start(self):
-        logger.debug("starting heartbeat send/receive tasks...")
+        logger.info("starting heartbeat send/receive tasks...")
 
         send_fn = partial(
             Hjarta.send, socket=self.snd_sock, uid=self.config.uid, name=self.config.name
@@ -455,52 +448,18 @@ class Hjarta:
 
         await asyncio.gather(*self.tasks, return_exceptions=True)
 
-        logger.debug("heartbeat tasks stopped: OK")
+        logger.info("heartbeat tasks stopped: OK")
 
     async def listen_to(self, endpoint: str) -> None:
         self.rcv_sock.connect(endpoint)
         self.rcv_sock.setsockopt(zmq.SUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
+        logger.info('Started listening to %s: OK', endpoint)
 
     async def stop_listening_to(self, endpoint: str) -> None:
         self.rcv_sock.setsockopt(zmq.UNSUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
         self.rcv_sock.disconnect(endpoint)
+        logger.info('Stopped listening to %s: OK', endpoint)
 
     async def reset_timer(self):
         logger.debug("resetting heartbeat timer...")
         self.reset_fn()
-
-
-# ======================================================================================
-async def test_hjarta():
-    ctx = zmq.asyncio.Context()
-
-    async def log(x):
-        logger.debug(x)
-        await asyncio.sleep(1)
-
-    class TestConfig(BaseConfig):
-
-        def __init__(self):
-            super().__init__()
-            self.name = "test_folk"
-            self.hb_interval = 1
-            self.socket = zmq.REQ
-            self.actions = [log]
-            self.queues = []
-            self.latency_tracker = None
-
-            self._endpoints = {
-                "heartbeat": "tcp://127.0.0.1:5555",
-            }
-
-    h = Hjarta(ctx, TestConfig())
-
-    await h.start()
-    await asyncio.sleep(10)
-    await h.stop()
-
-    # logger.debug(vars(h))
-
-
-if __name__ == "__main__":
-    asyncio.run(test_hjarta())

@@ -9,11 +9,19 @@ Created on Sep 10 20:15:20 2023
 """
 import asyncio
 import logging
-import os
 import sys
 import zmq
 import zmq.asyncio
 
+from os.path import dirname as dir
+
+sys.path.append(dir(dir(__file__)))
+
+import heartbeat as hb  # noqa: F401, E402
+import util.sockets as sockets  # noqa: F401, E402
+
+# --------------------------------------------------------------------------------------
+# configure logger
 
 logger = logging.getLogger("main")
 logger.setLevel(logging.DEBUG)
@@ -28,16 +36,7 @@ ch.setFormatter(formatter)
 logger.addHandler(ch)
 
 # --------------------------------------------------------------------------------------
-current = os.path.dirname(os.path.realpath(__file__))
-parent = os.path.dirname(current)
-sys.path.append(parent)
-# --------------------------------------------------------------------------------------
-
-import heartbeat as hb  # noqa: F401, E402
-import sockets  # noqa: F401, E402
-
-
-# poller = zmq.Poller()
+# prepare the context
 
 s_defs = [
     sockets.SockDef(
@@ -61,7 +60,7 @@ s_defs = [
 
 # --------------------------------------------------------------------------------------
 async def mock_callback(msg: str) -> None:
-    logger.debug("got a message: %s", msg)
+    logger.debug("mock callback got a message: %s", msg)
 
 
 async def test(pub_sub: bool = False):
@@ -81,8 +80,12 @@ async def test(pub_sub: bool = False):
     sockets["monitor"].connect("inproc://heartbeat")
 
     tasks = [
-        asyncio.create_task(hb.monitor_hb(sockets["monitor"], [mock_callback])),
-        asyncio.create_task(hb.hb_client_req(sockets["heartbeat"])),
+        asyncio.create_task(hb.recv_hb(sockets["monitor"], [mock_callback])),
+        asyncio.create_task(
+            hb.hb_client_req(
+                ctx=ctx, socket=sockets["heartbeat"], uid="test", name="test",
+            )
+        ),
     ]
 
     try:
@@ -104,8 +107,33 @@ async def test(pub_sub: bool = False):
         logger.info("shutdown complete: OK")
 
 
+async def test_hjarta():
+    ctx = zmq.asyncio.Context()
+
+    class TestConfig(hb.BaseConfig):
+
+        def __init__(self):
+            super().__init__()
+            self.name = "test_folk"
+            self.hb_interval = 1
+            self.socket = zmq.REQ
+            self.actions = [mock_callback]
+            self.queues = []
+            self.latency_tracker = None
+
+            self._endpoints = {
+                "heartbeat": "tcp://127.0.0.1:5555",
+            }
+
+    h = hb.Hjarta(ctx, TestConfig())
+
+    await h.start()
+    await asyncio.sleep(10)
+    await h.stop()
+
+
 if __name__ == "__main__":
     try:
-        asyncio.run(test(False))
+        asyncio.run(test_hjarta())
     except KeyboardInterrupt:
         pass

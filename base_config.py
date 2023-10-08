@@ -19,13 +19,15 @@ from typing import Sequence, Optional, TypeVar
 from uuid import uuid4
 
 import config as cnf
-from sockets import SockDef
-from fukujou import generate_curve_key_pair
+from fukujou.curve import generate_curve_key_pair
+from util.sockets import SockDef
 
 
 class BaseConfig:
     """Base configuration for components."""
 
+    name: str = "you really should set a name"
+    service_type: str = "generic"  # type of service, e.g. "streamer", ...
     desc: str = ""  # service description, just for printing, not essential
 
     encrypted: bool = True  # use encryption or not
@@ -40,10 +42,14 @@ class BaseConfig:
         self,
         exchange: Optional[str] = "all",
         markets: Optional[Sequence[str]] = ["all"],
+        service_type: Optional[str] = "generic",
         sock_defs: Sequence[SockDef] = [],
         **kwargs
     ) -> None:
         self.uid: str = str(uuid4())
+
+        self.name = kwargs.get("name", BaseConfig.name)
+        self.service_type = service_type or BaseConfig.service_type
 
         self.exchange: str = exchange
         self.markets: Sequence[str] = markets

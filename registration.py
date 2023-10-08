@@ -48,7 +48,7 @@ from zmqbricks.exceptions import (
 )
 
 logger = logging.getLogger("main.registration")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 DEFAULT_RGSTR_TIMEOUT = 10  # seconds
@@ -314,7 +314,7 @@ async def process_registration_reply(reply: dict[str, Any]) -> Scroll | None:
     """
     # build formalized registration reply from dictionary response
     try:
-        return Scroll.from_dict(reply)
+        return True, Scroll.from_dict(reply)
 
     except (KeyError, AttributeError):
         # let's see if this is an error message, or just garbage
@@ -331,6 +331,7 @@ async def process_registration_reply(reply: dict[str, Any]) -> Scroll | None:
 async def call_them_callbacks(actions: Sequence[Coroutine], payload: Any) -> None:
     for action in actions:
         try:
+            logger.info("calling %s", action)
             await action(payload)
         except Exception as e:
             logger.critical("action failed: %s", action, exc_info=1)
@@ -515,16 +516,20 @@ async def register(
 
         else:
             # build formalized registration reply from dictionary response
-            scroll = await process_registration_reply(response)
+            registered, peer_scroll = await process_registration_reply(response)
 
             # execute  provided actions with reply, if any
             if actions:
                 await call_them_callbacks(actions, scroll)
 
             logger.info("===================================================")
-            logger.info("registered with collector at %s", config.register_at)
+            logger.info(
+                "registered with %s at %s",
+                peer_scroll.service_name,
+                peer_scroll.endpoints.get("registration"),
+            )
 
-    return scroll
+    return peer_scroll
 
 
 async def send_reply(
@@ -579,8 +584,10 @@ async def monitor_registration(
 
             # perform callbacks for valid request
             if callbacks:
-                for callback in callbacks:
-                    await callback(request)
+                [await callback(request) for callback in callbacks]
+
+            else:
+                logger.warning("no callbacks provided -> request will not be processed")
 
             # send to queue(s) for valid request
             if queues:
@@ -667,14 +674,8 @@ class Rawi:
     # ..................................................................................
     async def start(self):
         """Start the Rawi instance"""
-        self.monitor_task = asyncio.create_task(monitor_registration(self.rgstr_sock))
-
-        if self.config.service_registry is not None:
-            rgstr_info_fn = partial(
-                self.static_rgstr_info_fn, self.config.service_registry
-            )
-
-            await self.register(rgstr_info_fn=rgstr_info_fn, actions=[])
+        self.monitor_task = asyncio.create_task(
+            monitor_registration(self.rgstr_sock, self.actions))
 
     async def stop(self):
         """Stop the Rawi instance"""
@@ -684,20 +685,35 @@ class Rawi:
         self.rgstr_sock.close()
 
     # ..................................................................................
+    async def register_with_service_registry(self, config: ConfigT) -> Scroll | None:
+        if config.service_registry is not None:
+            rgstr_info_fn = partial(
+                self.static_rgstr_info_fn,
+                self.config.service_registry
+            )
+
+            return await self.register(rgstr_info_fn=rgstr_info_fn, actions=[])
+        else:
+            logger.error(
+                "unable to regsiter with Central Service Registry , "
+                "missing service registry infomation"
+            )
+
+    # ..................................................................................
     async def register(
         self,
         rgstr_info_fn: Optional[Coroutine] = None,
         actions: Optional[Sequence[Coroutine]] = None
-    ) -> None:
+    ) -> Scroll:
 
         logger.info("Registering ...")
 
         try:
-            await register(
+            return await register(
                 ctx=self.ctx,
                 config=self.config,
                 rgstr_info_fn=rgstr_info_fn or self.static_rgstr_info_fn,
-                actions=actions or self.actions
+                actions=actions
             )
         except RegistrationError as e:
             logger.critical(e)
@@ -723,6 +739,7 @@ class Rawi:
         error: Optional[str], optional
             any error that might have occured while processing the request
         """
+        logger.info("sending reply to %s", scroll.name)
 
         if not error:
             reply = Scroll.from_dict(config.as_dict())

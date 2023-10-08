@@ -31,9 +31,11 @@ from typing import Coroutine, Optional, Sequence, Mapping, TypeAlias, Callable, 
 
 from .fukujou.nonce import Nonce
 from .fukujou.curve import generate_curve_key_pair
+from .base_config import BaseConfig
 
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("main.registration")
-logger.setLevel(logging.INFO)
+# logger.setLevel(logging.INFO)
 
 
 DEFAULT_RGSTR_TIMEOUT = 10  # seconds
@@ -51,6 +53,10 @@ ContextT: TypeAlias = zmq.asyncio.Context
 
 
 # ======================================================================================
+def exception_handler(loop, context):
+    logger.error("caught EXCEPTION: %s -> %s", context.get("exception"))
+
+
 def get_ttl():
     return int(time() + TTL)
 
@@ -407,8 +413,8 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
             finally:
                 if not response and errors > DEFAULT_RGSTR_MAX_ERRORS:
                     raise MaxRetriesReached(
-                        "unable to register with collector %s after %s errors",
-                        peer_scroll.endpoint, DEFAULT_RGSTR_MAX_ERRORS
+                        "unable to register with collector {} after {} errors"
+                        .format(peer_scroll.endpoint, DEFAULT_RGSTR_MAX_ERRORS)
                     )
 
     return response
@@ -461,7 +467,7 @@ async def register(
             response = await _get_response(ctx, scroll, peer_scroll)
         except MaxRetriesReached as e:
             logger.error(e)
-            raise RegistrationError("registration: FAIL") from e
+            # raise RegistrationError("registration: FAIL") from e
         else:
             registered = True
 
@@ -511,6 +517,8 @@ async def monitor_registration(
         try:
             msg_bytes = await socket.recv_multipart()
 
+            logger.debug("received msg: %s", msg_bytes)
+
             if len(msg_bytes) == 2 and msg_bytes[1] == b"":
                 raise EmptyMessageError()
 
@@ -535,7 +543,8 @@ async def monitor_registration(
             await asyncio.sleep(1)
 
         except zmq.ZMQError as e:
-            logger.error("registration monitor -> zmq error: %s", e)
+            logger.error("registration monitor -> zmq error: %s", e, exc_info=1)
+            break
         except EmptyMessageError:
             # can happen when clients need to wait the receiver
             # to come back online ... not important
@@ -549,31 +558,162 @@ async def monitor_registration(
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.exception("unexpected error: %s", e)
-            logger.error("exception caused by this msg: %s", msg_bytes)
+            logger.exception("unexpected error: %s", e, exc_info=1)
+            # logger.error("exception caused by this msg: %s", msg_bytes)
 
     logger.info("registration monitor stopped: OK")
 
 
+# ======================================================================================
+#                                Registration OOP style                                #
+# ======================================================================================
+class Rawi:
+    """Class that manages registrations for peer kinsman.
+
+    rawi --> Arabic for registry
+    """
+
+    def __init__(
+        self,
+        ctx: ContextT,
+        config: ConfigT,
+        rgstr_info_fn: Callable,
+        actions: Optional[Sequence[Coroutine[Scroll, None, None]]] = None
+    ) -> None:
+        """Initialize the Rawi (registration) instance.
+
+        Parameters
+        ----------
+        ctx : ContextT
+            Currently active (async) ZeroMQ context
+
+        config : ConfigT
+            The co´mponent configuration object
+
+        rgstr_info_fn : Callable[None, Scroll]
+            A function that returns registration information. It
+            should return a Scroll instance from the peer that this
+            component should register with.
+
+        actions : Optional[Sequence[Coroutine[Scroll, None, None]]], optional
+            Actions to perform after a peer registered with this component.
+        """
+        self.ctx = ctx
+        self.config = config
+        self.rgstr_info_fn = rgstr_info_fn
+        self.actions = actions
+
+        logger.debug(config.rgstr_addr)
+
+        # configure the registration socket
+        logger.info("configuring registration socket at %s", config.rgstr_addr)
+        logger.debug(config.private_key)
+        logger.debug(config.public_key)
+        self.rgstr_sock = ctx.socket(zmq.ROUTER)
+        self.rgstr_sock.curve_secretkey = config.private_key.encode("ascii")
+        self.rgstr_sock.curve_publickey = config.public_key.encode("ascii")
+        self.rgstr_sock.curve_server = True
+        self.rgstr_sock.bind(config.rgstr_addr)
+
+        self.monitor_task = None
+
+        logger.debug("Rawi instance created")
+
+    def __del__(self):
+        self.rgstr_sock.close()
+
+    async def register(self):
+        await register(self.ctx, self.config, self.rgstr_info_fn, self.actions)
+
+    async def start(self):
+        self.monitor_task = asyncio.create_task(monitor_registration(self.rgstr_sock))
+
+    async def stop(self):
+        if self.monitor_task:
+            self.monitor_task.cancel()
+
+        del self
+
+
+# ======================================================================================
+async def test_rawi():
+    ctx = zmq.asyncio.Context()
+
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(exception_handler)
+
+    async def log(x):
+        logger.debug(x)
+        await asyncio.sleep(1)
+
+    # prepare a configuration for our test server
+    class Server(BaseConfig):
+
+        def __init__(self):
+            super().__init__()
+            self.name = "server"
+            self.service_type = 'collector'
+            self.exchange = "kucoin"
+            self.actions = []
+            self.queues = []
+            self.latency_tracker = None
+            self._endpoints = {
+                "registration": "tcp://*:11000",
+                "publisher": "tcp://127.0.0:5556"
+            }
+            self.publisher_addr = self._endpoints["publisher"]
+
+    # prepare a configuration for our test client
+    class Client(BaseConfig):
+
+        def __init__(self):
+            super().__init__()
+            self.name = "client"
+            self.service_type = 'streamer'
+            self.exchange = "kucoin"
+            self.actions = []
+            self.queues = []
+            self.latency_tracker = None
+            self._endpoints = {
+                "registration": "tcp://*:5560",
+                "publisher": "tcp://127.0.0:5561"
+            }
+            self.publisher_addr = self._endpoints["publisher"]
+            self._rgstr_max_errors = 1
+
+    cnf_srv = Server()
+    cnf_cli = Client()
+
+    # define a function that returns the registration information
+    def get_rgstr_info():
+
+        class C:
+            endpoint = "tcp://127.0.0.1:11000"
+            public_key = cnf_srv.public_key
+
+            def __repr__(self):
+                return f"C(endpoint={self.endpoint}, public_key={self.public_key})"
+
+        return C()
+
+    logger.info("server config: %s", cnf_srv.as_dict())
+    logger.info("client config: %s", cnf_cli.as_dict())
+    logger.info("registration info: %s", get_rgstr_info())
+
+    # start the Rawi instance
+    server = Rawi(ctx, cnf_srv, get_rgstr_info, [log])
+    client = Rawi(ctx, cnf_cli, get_rgstr_info, [log])
+
+    # try registering with the Rawi instance
+    await server.start()
+    await asyncio.sleep(1)
+    try:
+        await client.register()
+    except RegistrationError as e:
+        logger.error(e)
+    await asyncio.sleep(2)
+    await client.stop()
+    await server.stop()
+
 if __name__ == "__main__":
-    d = {
-        "service_type": "collector",
-        "service_name": "Collector for KUCOIN SPOT",
-        "endpoints": {},
-        "uid": "39f531e5-763b-4a1b-863d-b0b548542267",
-        "exchange": "kucoin",
-        "markets": ["spot"],
-        "desc": "",
-        "external_ip": "192.168.1.1",
-        "name": "Daireann Seamus X.",
-        "SUBSCRIBER_ADDR": "tcp://127.0.0.1:5582",
-        "PUBLISHER_ADDR": "tcp://127.0.0.1:5583",
-        "MGMT_ADDR": "tcp://127.0.0.1:5570",
-        "HB_ADDR": "tcp://127.0.0.1:5580"
-    }
-
-    # print(
-    #     [x for x in dir(Scroll) if not x.startswith("_")]
-    # )
-
-    print(Scroll.from_dict(d))
+    asyncio.run(test_rawi())

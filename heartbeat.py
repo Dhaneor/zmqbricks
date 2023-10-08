@@ -58,6 +58,7 @@ import zmq
 import zmq.asyncio
 
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Optional, Sequence, Callable, Mapping, Any, TypeVar, Coroutine
 
 # --------------------------------------------------------------------------------------
@@ -66,10 +67,12 @@ parent = os.path.dirname(current)
 sys.path.append(parent)
 # --------------------------------------------------------------------------------------
 
+from zmqbricks.base_config import BaseConfig, ConfigT  # noqa: F401, E402
 from zmqbricks.util.async_timer_with_reset import create_timer  # noqa: F401, E402
 
+# logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("main.heartbeat")
-logger.setLevel(logging.INFO)
+# logger.setLevel(logging.DEBUG)
 
 
 # constants
@@ -79,6 +82,7 @@ HB_REPLY = "HOY-HOY"
 DEFAULT_PUB_TOPIC = "heartbeat"
 DEFAULT_ENCODING = "utf-8"
 
+ContextT = TypeVar("ContextT", bound=zmq.asyncio.Context)
 PayloadDataT = TypeVar("PayloadDataT", bound=Mapping[str, Any])
 PayloadT = PayloadDataT | Coroutine[PayloadDataT, None, None]
 SocketT = TypeVar("SocketT", bound=zmq.Socket)
@@ -145,13 +149,14 @@ class HeartbeatMessage:
     #     return f"{self.name} says {self.greeting}"
 
     def _to_multipart(self) -> Sequence[bytes]:
+
         return [
             DEFAULT_PUB_TOPIC.encode(self.encoding),  # topic
             json.dumps(self.payload).encode(self.encoding),
             self.uid.encode(self.encoding),
             self.name.encode(self.encoding),
             self.greeting.encode(self.encoding),
-            str(self.timestamp).encode(self.encoding),
+            str(time.time()).encode(self.encoding),
         ]
 
     async def send(self) -> None:
@@ -234,7 +239,10 @@ async def recv_hb(
             # execute action(s), if provided
             if actions:
                 for action in actions:
-                    await action(hb_msg.uid, hb_msg.payload)
+                    try:
+                        await action(hb_msg.uid, hb_msg.payload)
+                    except Exception as e:
+                        logger.exception(e)
 
             # publish message to queue(s), if provided
             if queues:
@@ -292,7 +300,7 @@ async def send_hb(
         logger.error("ZMQ error: %s", e)
         raise Exception() from e
     else:
-        logger.debug("Sent heartbeat: OK")
+        logger.debug("I say '%s!'", hb_msg.greeting)
 
 
 async def hb_client_req(
@@ -380,10 +388,10 @@ async def start_hb_send_task(
         - The background task that sends heartbeat messages with hb_interval.
         - A coroutine that resets the timer.
     """
-    logger.debug("creating heartbeat task ...")
+    logger.debug("creating heartbeat send task ...")
 
     timer_fn, reset_fn = create_timer(hb_interval, send_fn, True)
-    return asyncio.create_task(timer_fn()), reset_fn
+    return asyncio.create_task(timer_fn(), name="hb_send"), reset_fn
 
 
 async def start_hb_recv_task(
@@ -392,26 +400,107 @@ async def start_hb_recv_task(
     queues: Optional[Sequence[asyncio.Queue]] = None,
     latency_tracker: Optional[Coroutine[float, None, None]] = None
 ) -> None:
-    return asyncio.create_task(recv_hb(socket, actions, queues, latency_tracker))
+    return asyncio.create_task(
+        recv_hb(socket, actions, queues, latency_tracker), name="hb_rcv"
+    )
 
 
 # ======================================================================================
 #                                  HEARTBEAT OOP STYLE                                 #
 # ======================================================================================
-class Herta:
+class Hjarta:
+    """Our beating heart.
 
-    def __init__(self, config: configT):
-        ...
+    Hjarta --> Old Norse word for heart.
+
+    """
+
+    send: Coroutine[None, None, None] = send_hb
+    listen: Coroutine[None, None, None] = recv_hb
+
+    def __init__(self, ctx: ContextT, config: ConfigT):
+        self.ctx = ctx
+        self.config = config
+        self.tasks: list = [None, None]
+
+        self.snd_sock: zmq.Socket = self.ctx.socket(zmq.PUB)
+        self.snd_sock.bind(config.hb_addr)
+
+        self.rcv_sock = self.ctx.socket(zmq.SUB)
+        self.rcv_sock.connect(config.hb_addr)
+        self.rcv_sock.setsockopt(zmq.SUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
+
+        self.on_snd: list[Coroutine] = []
+        self.on_rcv: list[Coroutine] = []
+
+        logger.debug("Hjarta initialized: OK")
+
+    async def start(self):
+        logger.debug("starting heartbeat send/receive tasks...")
+
+        send_fn = partial(
+            Hjarta.send, socket=self.snd_sock, uid=self.config.uid, name=self.config.name
+        )
+
+        self.tasks[0], self.reset_fn = await start_hb_send_task(
+            send_fn, self.config.hb_interval
+        )
+
+        self.tasks[1] = await start_hb_recv_task(self.rcv_sock, self.on_rcv)
+
+    async def stop(self):
+        for task in self.tasks:
+            if task is not None:
+                task.cancel()
+
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+
+        logger.debug("heartbeat tasks stopped: OK")
+
+    async def listen_to(self, endpoint: str) -> None:
+        self.rcv_sock.connect(endpoint)
+        self.rcv_sock.setsockopt(zmq.SUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
+
+    async def stop_listening_to(self, endpoint: str) -> None:
+        self.rcv_sock.setsockopt(zmq.UNSUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
+        self.rcv_sock.disconnect(endpoint)
+
+    async def reset_timer(self):
+        logger.debug("resetting heartbeat timer...")
+        self.reset_fn()
 
 
+# ======================================================================================
+async def test_hjarta():
+    ctx = zmq.asyncio.Context()
+
+    async def log(x):
+        logger.debug(x)
+        await asyncio.sleep(1)
+
+    class TestConfig(BaseConfig):
+
+        def __init__(self):
+            super().__init__()
+            self.name = "test_folk"
+            self.hb_interval = 1
+            self.socket = zmq.REQ
+            self.actions = [log]
+            self.queues = []
+            self.latency_tracker = None
+
+            self._endpoints = {
+                "heartbeat": "tcp://127.0.0.1:5555",
+            }
+
+    h = Hjarta(ctx, TestConfig())
+
+    await h.start()
+    await asyncio.sleep(10)
+    await h.stop()
+
+    # logger.debug(vars(h))
 
 
 if __name__ == "__main__":
-    msg = HeartbeatMessage(
-        socket=zmq.asyncio.Context().socket(zmq.REQ),
-        uid="1234567890",
-        name="Alice",
-    )
-
-    print(msg)
-    print(msg._to_multipart())
+    asyncio.run(test_hjarta())

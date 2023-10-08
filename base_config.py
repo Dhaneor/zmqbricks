@@ -18,13 +18,9 @@ import requests
 from typing import Sequence, Optional, TypeVar
 from uuid import uuid4
 
-import config as cnf
-
-from sockets import SockDef
-from fukujou.curve import generate_curve_key_pair
-
-
-ScrollT = TypeVar("ScrollT", bound=object)
+from . import config as cnf
+from .sockets import SockDef
+from .fukujou.curve import generate_curve_key_pair
 
 
 class BaseConfig:
@@ -136,6 +132,9 @@ class BaseConfig:
     def from_dict(d: dict) -> "BaseConfig":
         """Build a configuration object from a dictionary."""
         return BaseConfig(**d)
+
+
+ConfigT = TypeVar("ConfigT", bound=BaseConfig)
 
 
 if __name__ == "__main__":

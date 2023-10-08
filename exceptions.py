@@ -7,6 +7,10 @@ Created on Sun Oct 08 16:16:23 2023
 """
 
 
+class BadScrollError(BaseException):
+    ...
+
+
 class MissingTtlError(BaseException):
     ...
 

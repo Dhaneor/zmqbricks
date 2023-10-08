@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Optional, Mapping, Sequence, Coroutine, TypeVar
 
 from .registration import Scroll
+from .exceptions import BadScrollError
 
 
 if __name__ == "__main__":
@@ -287,7 +288,7 @@ class Kinsfolk:
             )
         except Exception as e:
             logger.error(f"unexpected error creating a Kinsman: {e}")
-            return False
+            raise BadScrollError() from e
         else:
             return True
 

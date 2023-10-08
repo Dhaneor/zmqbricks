@@ -58,6 +58,8 @@ class BaseConfig:
         self._sock_defs: Sequence[SockDef] = sock_defs
         self._hb_interval: float = kwargs.get("hb_interval", BaseConfig.hb_interval)
         self._hb_liveness: int = kwargs.get("hb_liveness", BaseConfig.hb_liveness)
+
+        self.service_registry: Optional[dict[str, str]] = None
         self._rgstr_timeout: int = kwargs.get(
             "rgstr_timeout", BaseConfig.rgstr_timeout
         )

@@ -26,9 +26,11 @@ import zmq
 
 from collections import deque
 from dataclasses import dataclass
+from functools import partial
 from time import time
 from typing import (
-    Coroutine, Optional, Sequence, Mapping, TypeAlias, Callable, Any, TypeVar
+    Coroutine, Optional, Sequence, Mapping, TypeAlias, Callable, Any, TypeVar,
+    NamedTuple
 )
 
 # from zmqbricks.kinsfolk import KinsfolkT
@@ -46,7 +48,7 @@ from zmqbricks.exceptions import (
 )
 
 logger = logging.getLogger("main.registration")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 DEFAULT_RGSTR_TIMEOUT = 10  # seconds
@@ -292,6 +294,40 @@ def check_ttl(request):
 
 
 # --------------------------------------------------------------------------------------
+async def process_registration_reply(reply: dict[str, Any]) -> Scroll | None:
+    """Process the registration reply, return a Scroll, if possible.
+
+    Parameters
+    ----------
+    reply : dict[str, Any]
+        _description_
+
+    Returns
+    -------
+    tuple | None
+        _description_
+
+    Raises
+    ------
+    RegistrationError
+        if we got an error message, or an invalid message.
+    """
+    # build formalized registration reply from dictionary response
+    try:
+        return Scroll.from_dict(reply)
+
+    except (KeyError, AttributeError):
+        # let's see if this is an error message, or just garbage
+        if "error" in reply:
+            error = reply["error"]
+            logger.critical("registration not accepted by peer: %e", error)
+        else:
+            error = "invalid response"
+            logger.critical("invalid reply from collector: %s", reply)
+
+        raise RegistrationError(f"registration: FAIL ({error})")
+
+
 async def call_them_callbacks(actions: Sequence[Coroutine], payload: Any) -> None:
     for action in actions:
         try:
@@ -453,33 +489,33 @@ async def register(
 
     while not registered:
 
-        while not (peer_scroll := rgstr_info_fn()):
+        # rgstr_info_fn may or may not try to to retrieve updated
+        # registration information from the Central Service Registry.
+        # This makes no sense if we are trying to initially register
+        # the caller with the CSR. Then rgstr_info_fn should return
+        # the static information for the Central Service Registry.
+        while not (peer_scroll := await rgstr_info_fn()):
             asyncio.sleep(10)
 
         logger.info(
-            "... registering with collector at %s",
-            peer_scroll.endpoints.get("registration")
+            "... registering with %s - at %s",
+            peer_scroll.service_name,
+            peer_scroll.endpoints.get("registration"),
         )
 
         try:
             response = await _get_response(ctx, scroll, peer_scroll)
+
         except ValueError as e:
             logger.error(e)
             await asyncio.sleep(5)
+
         except MaxRetriesReached as e:
             logger.error(e)
-            # raise RegistrationError("registration: FAIL") from e
-        else:
-            registered = True
 
+        else:
             # build formalized registration reply from dictionary response
-            try:
-                scroll = Scroll.from_dict(response)
-            except (KeyError, AttributeError) as e:
-                logger.critical(
-                    "invalid reply from collector: %s", response, exc_info=1
-                )
-                raise RegistrationError("registration: FAIL") from e
+            scroll = await process_registration_reply(response)
 
             # execute  provided actions with reply, if any
             if actions:
@@ -491,14 +527,11 @@ async def register(
     return scroll
 
 
-async def process_registration(
+async def send_reply(
     req: Scroll,
     config: ConfigT,
     kinsfolk: KinsfolkT
 ):
-    if not await kinsfolk.accept(req):
-        return
-
     reply = Scroll.from_dict(config.as_dict())
 
     await reply.send(socket=req._socket, routing_key=req._routing_key)
@@ -617,12 +650,10 @@ class Rawi:
         self.rgstr_info_fn = rgstr_info_fn
         self.actions = actions
 
-        logger.debug(config.rgstr_addr)
-
         # configure the registration socket
         logger.info("configuring registration socket at %s", config.rgstr_addr)
-        logger.debug(config.private_key)
-        logger.debug(config.public_key)
+        logger.debug("public key: %s", config.public_key)
+
         self.rgstr_sock = ctx.socket(zmq.ROUTER)
         self.rgstr_sock.curve_secretkey = config.private_key.encode("ascii")
         self.rgstr_sock.curve_publickey = config.public_key.encode("ascii")
@@ -633,17 +664,108 @@ class Rawi:
 
         logger.debug("Rawi instance created")
 
-    def __del__(self):
-        self.rgstr_sock.close()
-
-    async def register(self):
-        await register(self.ctx, self.config, self.rgstr_info_fn, self.actions)
-
+    # ..................................................................................
     async def start(self):
+        """Start the Rawi instance"""
         self.monitor_task = asyncio.create_task(monitor_registration(self.rgstr_sock))
 
+        if self.config.service_registry is not None:
+            rgstr_info_fn = partial(
+                self.static_rgstr_info_fn, self.config.service_registry
+            )
+
+            await self.register(rgstr_info_fn=rgstr_info_fn, actions=[])
+
     async def stop(self):
+        """Stop the Rawi instance"""
         if self.monitor_task:
             self.monitor_task.cancel()
 
-        del self
+        self.rgstr_sock.close()
+
+    # ..................................................................................
+    async def register(
+        self,
+        rgstr_info_fn: Optional[Coroutine] = None,
+        actions: Optional[Sequence[Coroutine]] = None
+    ) -> None:
+
+        logger.info("Registering ...")
+
+        try:
+            await register(
+                ctx=self.ctx,
+                config=self.config,
+                rgstr_info_fn=rgstr_info_fn or self.static_rgstr_info_fn,
+                actions=actions or self.actions
+            )
+        except RegistrationError as e:
+            logger.critical(e)
+        except Exception as e:
+            logger.critical("unexpected error: %s", e, exc_info=1)
+
+    async def send_reply(
+        self,
+        scroll: Scroll,
+        config: ConfigT,
+        error: Optional[str] = None,
+    ):
+        """Sends a reply for a registration request that we received.
+
+        Parameters
+        ----------
+        scroll : Scroll
+            the peer scroll from the registration request
+
+        config: ConfigT
+            our configuration
+
+        error: Optional[str], optional
+            any error that might have occured while processing the request
+        """
+
+        if not error:
+            reply = Scroll.from_dict(config.as_dict())
+            await reply.send(socket=scroll._socket, routing_key=scroll._routing_key)
+
+        else:
+            # hopefully this works to inform the client about the error,
+            # but depending on the error, this might not be possible
+            try:
+                await self.rgstr_sock.send_multipart(
+                    [
+                        scroll._routing_key,
+                        json.dumps({"error": error}).encode("utf-8")
+                    ]
+                )
+            except AttributeError as e:
+                logger.error(e)
+                return
+            except zmq.ZMQError as e:
+                logger.error(e)
+            except Exception as e:
+                logger.error("unexpected error: %s", e, exc_info=1)
+
+    async def static_rgstr_info_fn(self, service_registry: dict) -> NamedTuple:
+        """Return static registration information for the Central Service Registry."""
+
+        if not isinstance(service_registry, dict):
+            raise RegistrationError("service_registry in config must be a dictionary")
+
+        if "endpoint" not in service_registry:
+            raise RegistrationError("service_registry in config, missing: 'endpoint'")
+
+        class StaticRegistrationInfo(NamedTuple):
+            service_name: str
+            endpoint: str
+            public_key: str
+            endpoints: dict
+
+        rgstr_endpoint = service_registry.get("endpoint", None)
+
+        return StaticRegistrationInfo(
+            service_name="Central Service Registry",
+            endpoint=rgstr_endpoint,
+            public_key=service_registry.get("public_key", None),
+            endpoints={"registration": rgstr_endpoint}
+        )

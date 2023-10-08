@@ -63,7 +63,7 @@ from zmqbricks.base_config import ConfigT  # noqa: F401, E402
 from zmqbricks.util.async_timer_with_reset import create_timer  # noqa: F401, E402
 
 logger = logging.getLogger("main.heartbeat")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 # constants
@@ -245,7 +245,7 @@ async def recv_hb(
         except zmq.ZMQError as e:
             logger.error("ZMQ  error: %s", e)
         except asyncio.CancelledError:
-            logger.info("heartbeat monitoring cancelled")
+            logger.debug("heartbeat monitoring cancelled")
             break
         except Exception as e:
             logger.error("unexpected error: %s", e)
@@ -418,8 +418,6 @@ class Hjarta:
         self.snd_sock.bind(config.hb_addr)
 
         self.rcv_sock = self.ctx.socket(zmq.SUB)
-        self.rcv_sock.connect(config.hb_addr)
-        self.rcv_sock.setsockopt(zmq.SUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
 
         self.on_snd: list[Coroutine] = []
         self.on_rcv: list[Coroutine] = []
@@ -444,11 +442,20 @@ class Hjarta:
             if task is not None:
                 task.cancel()
 
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        asyncio.gather(*self.tasks, return_exceptions=True)
 
         logger.info("heartbeat tasks stopped: OK")
 
     async def listen_to(self, endpoint: str) -> None:
+        """Listen to a given endpoint for heartbeats.
+
+        Endpoint must be a valid ZMQ endpoint for a PUB/XPUB socket.
+
+        Parameters
+        ----------
+        endpoint : str
+           endoint address
+        """
         self.rcv_sock.connect(endpoint)
         self.rcv_sock.setsockopt(zmq.SUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
         logger.info('Started listening to %s: OK', endpoint)

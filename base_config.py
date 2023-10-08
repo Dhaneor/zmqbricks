@@ -18,9 +18,9 @@ import requests
 from typing import Sequence, Optional, TypeVar
 from uuid import uuid4
 
-from . import config as cnf
-from .sockets import SockDef
-from .fukujou.curve import generate_curve_key_pair
+import config as cnf
+from sockets import SockDef
+from fukujou import generate_curve_key_pair
 
 
 class BaseConfig:

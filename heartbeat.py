@@ -67,8 +67,8 @@ parent = os.path.dirname(current)
 sys.path.append(parent)
 # --------------------------------------------------------------------------------------
 
-from zmqbricks.base_config import BaseConfig, ConfigT  # noqa: F401, E402
-from zmqbricks.util.async_timer_with_reset import create_timer  # noqa: F401, E402
+from base_config import BaseConfig, ConfigT  # noqa: F401, E402
+from util.async_timer_with_reset import create_timer  # noqa: F401, E402
 
 # logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("main.heartbeat")

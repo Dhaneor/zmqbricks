@@ -89,6 +89,7 @@ class Gond:
         if peer_scroll:
             logger.debug("finishing registration with CSR")
             await self.process_registration(peer_scroll, reply=False)
+            logger.info("registered with CSR: OK")
 
         return self
 

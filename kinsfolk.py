@@ -86,6 +86,12 @@ class Kinsman:
     def is_active(self) -> bool:
         return self.status == 'active'
 
+    def activate(self) -> None:
+        self.status = "active"
+
+    def deactivate(self) -> None:
+        self.status = "inactive"
+
     @staticmethod
     def from_scroll(scroll: Scroll, initial_liveness: int) -> "Kinsman":
         """Creates a Kinsman from a Scroll message.
@@ -232,6 +238,9 @@ class Kinsfolk:
         identity: str
             identity of the kinsman to update
 
+        payload: dict
+            just here for compatibility with the sender ...
+
         on_missing: Coroutine
             call this if the identity is unknown, should expect to receive
             the identity as an argument
@@ -244,9 +253,9 @@ class Kinsfolk:
             kinsman.last_health_check = now
             logger.debug("'HOY!' from %s", self._kinsfolk[identity])
             # if the kinsman's status is set to "inactive", re-activate it
-            if kinsman.status != 'active':
+            if not kinsman.is_active:
                 logger.info("... re-activating inactive kinsman")
-                kinsman.status = 'active'
+                kinsman.activate()
         else:
             logger.warning(
                 "Kinsman %s not found in Kinsfolk -> %s", identity, self._kinsfolk
@@ -299,7 +308,7 @@ class Kinsfolk:
         self._kinsfolk = {
             identity: kinsman
             for identity, kinsman in self._kinsfolk.items()
-            if (self._is_alive(kinsman, now)) | (kinsman.status == "inactive")
+            if (self._is_alive(kinsman, now)) | (not kinsman.is_active)
         }
 
     def _is_alive(self, kinsman: Kinsman, now: int) -> bool:

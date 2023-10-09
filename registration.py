@@ -695,7 +695,7 @@ class Rawi:
             return await self.register(rgstr_info_fn=rgstr_info_fn, actions=[])
         else:
             logger.error(
-                "unable to regsiter with Central Service Registry , "
+                "unable to register with Central Service Registry , "
                 "missing service registry infomation"
             )
 

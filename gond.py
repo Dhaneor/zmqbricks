@@ -6,8 +6,15 @@ the data sources/analysis framework.
 
 Using this context manager makes it possible to focus on the core
 functionality for components that use it, while making sure that
-the 'basic stuff' is done reliably and in a stanmdardized and
+the 'basic stuff' is done reliably and in a standardized and
 predictable manner.
+
+In the world of Middle-earth, an elven fortified settlement is
+called a "gond", which can be translated as a "stronghold" or
+"keep". The word itself comes from the Elvish language Sindarin,
+where it means "stronghold of stone". The term is also used to
+refer to the capital city of Gondor, which is fitting given the
+city's ancient and impenetrable architecture.
 
 The Gond class combines the following parts:
 - kinsfolk registry
@@ -42,13 +49,6 @@ class Gond:
     """Skeleton class for components in the data sources/analysis framework.
 
     This is to be used as a context manager!
-
-    In the world of Middle-earth, an elven fortified settlement is
-    called a "gond", which can be translated as a "stronghold" or
-    "keep". The word itself comes from the Elvish language Sindarin,
-    where it means "stronghold of stone". The term is also used to
-    refer to the capital city of Gondor, which is fitting given the
-    city's ancient and impenetrable architecture.
     """
 
     kinsfolk = kf.Kinsfolk  # kinsfolk registry component
@@ -82,14 +82,23 @@ class Gond:
         # registration monitoring ...
         self.tasks.append(asyncio.create_task(self.rawi.start()))
 
-        logger.debug("Starting registration with CSR...")
+        # everyone needs to register with the Central Service Registry,
+        # except 'Amanya', which is the CSR
+        logger.debug("service_type: %s", self.config.service_type)
 
-        peer_scroll = await self.rawi.register_with_service_registry(self.config)
+        if not self.config.service_type == "amanya":
+            logger.debug("Starting registration with CSR...")
 
-        if peer_scroll:
-            logger.debug("finishing registration with CSR")
-            await self.process_registration(peer_scroll, reply=False)
-            logger.info("registered with CSR: OK")
+            peer_scroll = await self.rawi.register_with_service_registry(self.config)
+
+            if peer_scroll:
+                logger.debug("finishing registration with CSR")
+                await self.process_registration(peer_scroll, reply=False)
+                logger.info("registered with CSR: OK")
+        else:
+            logger.info(
+                "skipping registration with CSR for %s" % self.config.service_type
+            )
 
         return self
 

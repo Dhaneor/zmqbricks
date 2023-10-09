@@ -218,7 +218,9 @@ class Kinsfolk:
         logger.debug("watching out done")
 
     async def get_all(self, service_type: str) -> "Kinsfolk":
-        return [k for k in self._kinsfolk.values() if k.service_type == service_type]
+        return [
+            k for k in self.active_kinsmen.values() if k.service_type == service_type
+        ]
 
     # .................................................................................
     async def add(self, kinsman: Kinsman) -> None:

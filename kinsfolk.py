@@ -40,7 +40,7 @@ if __name__ == "__main__":
     logger.setLevel(logging.INFO)
 else:
     logger = logging.getLogger("main.kinsfolk")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
 
 GRACE_PERIOD = 86400  # delete inactive kinsman after x seconds
@@ -237,17 +237,16 @@ class Kinsfolk:
             the identity as an argument
         """
         kinsman = self._kinsfolk.get(identity, None)
+        now = time.time()
 
         if kinsman:
-            kinsman.last_seen, kinsman.liveness = time.time(), self.hb_liveness
+            kinsman.last_seen, kinsman.liveness = now, self.hb_liveness
+            kinsman.last_health_check = now
             logger.debug("'HOY!' from %s", self._kinsfolk[identity])
             # if the kinsman's status is set to "inactive", re-activate it
             if kinsman.status != 'active':
                 logger.info("... re-activating inactive kinsman")
                 kinsman.status = 'active'
-                kinsman.last_seen = time.time()
-                kinsman.last_health_check = time.time()
-                kinsman.liveness = self.hb_liveness
         else:
             logger.warning(
                 "Kinsman %s not found in Kinsfolk -> %s", identity, self._kinsfolk
@@ -300,7 +299,7 @@ class Kinsfolk:
         self._kinsfolk = {
             identity: kinsman
             for identity, kinsman in self._kinsfolk.items()
-            if (self._is_alive(kinsman, now)) or (kinsman.status == "inactive")
+            if (self._is_alive(kinsman, now)) | (kinsman.status == "inactive")
         }
 
     def _is_alive(self, kinsman: Kinsman, now: int) -> bool:
@@ -327,9 +326,12 @@ class Kinsfolk:
         if kinsman.liveness > 0:
             return True
 
+        # if we get here, the kinsman is at least "inactive"
         logger.warning(
-            "Thy shall mourn the passing of our kinsman  %s!", kinsman.name
+            "Thy may mourn the passing of our kinsman  %s!", kinsman.name
         )
+
+        kinsman.status = "inactive"
 
         if self.on_inactive_kinsman:
             asyncio.create_task(self.on_inactive_kinsman(kinsman=kinsman))

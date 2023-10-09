@@ -48,7 +48,7 @@ from zmqbricks.exceptions import (
 )
 
 logger = logging.getLogger("main.registration")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 DEFAULT_RGSTR_TIMEOUT = 10  # seconds
@@ -520,7 +520,7 @@ async def register(
 
             # execute  provided actions with reply, if any
             if actions:
-                await call_them_callbacks(actions, scroll)
+                await call_them_callbacks(actions, peer_scroll)
 
             logger.info("===================================================")
             logger.info(

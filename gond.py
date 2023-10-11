@@ -40,7 +40,7 @@ from . import exceptions as exc
 
 logger = logging.getLogger("main.gond")
 
-configT = TypeVar("configT", bound=cnf.BaseConfig)
+ConfigT = TypeVar("ConfigT", bound=cnf.BaseConfig)
 ContextT = TypeVar("ContextT", bound=zmq.asyncio.Context)
 
 
@@ -58,7 +58,7 @@ class Gond:
 
     rgstr_info_fn = None  # a function that returns registration information
 
-    def __init__(self, config: configT, ctx: Optional[ContextT] = None, **kwargs) -> None:
+    def __init__(self, config: ConfigT, ctx: Optional[ContextT] = None, **kwargs) -> None:
         self.config = config
         self.ctx = ctx or zmq.asyncio.Context()
 

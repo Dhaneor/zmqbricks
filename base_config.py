@@ -30,7 +30,7 @@ class BaseConfig:
     service_type: str = "generic"  # type of service, e.g. "streamer", ...
     desc: str = ""  # service description, just for printing, not essential
 
-    encrypted: bool = True  # use encryption or not
+    encrypt: bool = True  # use encryption or not
 
     hb_interval: float = cnf.HB_INTERVAL  # heartbeat interval (seconds)
     hb_liveness: int = cnf.HB_LIVENESS  # heartbeat liveness (max missed heartbeats)

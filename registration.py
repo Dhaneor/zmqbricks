@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import zmq
+from zmq.utils.monitor import parse_monitor_message
 
 from collections import deque
 from dataclasses import dataclass
@@ -52,7 +53,7 @@ logger.setLevel(logging.DEBUG)
 
 
 DEFAULT_RGSTR_TIMEOUT = 10  # seconds
-DEFAULT_RGSTR_LOG_INTERVAL = 900  # resend request after (secs)
+DEFAULT_RGSTR_LOG_INTERVAL = 900  # log the same message again after (secs)
 DEFAULT_RGSTR_MAX_ERRORS = 10  # maximum number of registration errors
 
 ENCODING = "utf-8"
@@ -366,7 +367,7 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
     """
 
     # prepare variables
-    response, registered, errors, last_log = None, False, 0, time()
+    response, registered, errors, last_log = None, False, 0, time() - 900
     public_key, private_key = generate_curve_key_pair()
     rgstr_endpoint = peer_scroll.endpoints.get("registration", None)
 
@@ -378,6 +379,8 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
     # good luck!
     while not registered:
         now = time()
+
+        # do not log every attempt ...
         log_it = now > last_log + DEFAULT_RGSTR_LOG_INTERVAL
 
         # exponential backoff for exceptions, not used if collector is
@@ -385,7 +388,7 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
         # ... the show must go on!
         time_out_after_error = TTL + 2 ** errors
 
-        # NOTE: We need to consider the possibility that collctor is
+        # NOTE: We need to consider the possibility that our peer is
         #       offline/unreachable. But we also don't want to wait
         #       forever for a response. Therefore we will use a
         #       timeout, but that means that the socket needs to be
@@ -403,25 +406,43 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
             last_log = now
 
         with zmq.asyncio.Socket(ctx, zmq.DEALER) as sock:
-            # configure socket & connection encryption
-            sock.setsockopt(zmq.LINGER, TTL)
-            sock.curve_secretkey = private_key.encode("ascii")
-            sock.curve_publickey = public_key.encode("ascii")
-            sock.curve_serverkey = peer_scroll.public_key.encode("ascii")
-            sock.connect(rgstr_endpoint)
+            try:
+                # configure socket & connection encryption
+                server_public_key = peer_scroll.public_key
+                logger.debug("will use server public key: %s" % server_public_key)
 
-            # send the request
-            await scroll.send(sock)
+                sock.setsockopt(zmq.LINGER, TTL)
+                sock.curve_secretkey = private_key.encode("ascii")
+                sock.curve_publickey = public_key.encode("ascii")
+                sock.curve_serverkey = server_public_key.encode("ascii")
+                sock.connect(rgstr_endpoint)
+
+                # send the request
+                await scroll.send(sock)
+
+                monitor = sock.get_monitor_socket()
 
             # ... & wait for an answer, retry if necessary
-            try:
+                try:
+                    event = await asyncio.wait_for(monitor.recv_multipart(), 2)
+                    parsed = parse_monitor_message(event)
+                    logger.debug("monitor msg: %s", parsed)
+                except asyncio.TimeoutError:
+                    pass
+                except zmq.ZMQError as e:
+                    logger.error("registration monitor -> zmq error: %s", e, exc_info=1)
+
                 response = await asyncio.wait_for(sock.recv_json(), TTL)
+
+            except ConnectionRefusedError as e:
+                logger.error("connection refused: %s", e, exc_info=1)
 
             except asyncio.TimeoutError:
                 # don't log it every time
                 if log_it:
                     logger.warning(
-                        "... collector unreachable, but I won't give up easily"
+                        "... %s unreachable, but I won't give up easily",
+                        peer_scroll.service_name,
                     )
                 errors += 1
 
@@ -444,8 +465,12 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
             finally:
                 if not response and errors > DEFAULT_RGSTR_MAX_ERRORS:
                     raise MaxRetriesReached(
-                        "unable to register with collector {} after {} errors"
-                        .format(rgstr_endpoint, DEFAULT_RGSTR_MAX_ERRORS)
+                        "unable to register with {}r {} after {} errors"
+                        .format(
+                            peer_scroll.service_name,
+                            rgstr_endpoint,
+                            DEFAULT_RGSTR_MAX_ERRORS
+                        )
                     )
 
     return response
@@ -499,9 +524,10 @@ async def register(
             asyncio.sleep(10)
 
         logger.info(
-            "... registering with %s - at %s",
+            "... registering with %s - at %s (public key: %s)",
             peer_scroll.service_name,
             peer_scroll.endpoints.get("registration"),
+            peer_scroll.public_key,
         )
 
         try:
@@ -547,6 +573,7 @@ async def monitor_registration(
     socket: zmq.Socket,
     callbacks: Optional[Sequence[Coroutine]] = None,
     queues: Optional[Sequence[asyncio.queues.Queue]] = None,
+    verbose: bool = True
 ) -> None:
     """Monitors the registration socket.
 
@@ -565,8 +592,20 @@ async def monitor_registration(
 
     nonces = deque(maxlen=MAX_LEN_NONCE_CACHE)
 
+    # monitor = socket.get_monitor_socket()
+
     while True:
         try:
+            # try:
+            #     event = await asyncio.wait_for(monitor.recv_multipart(), 2)
+            #     parsed = parse_monitor_message(event)
+            #     logger.debug("monitor msg: %s", parsed)
+            # except asyncio.TimeoutError:
+            #     pass
+            # except zmq.ZMQError as e:
+            #     logger.error("registration monitor -> zmq error: %s", e, exc_info=1)
+            #     break
+
             msg_bytes = await socket.recv_multipart()
 
             logger.debug("received msg: %s", msg_bytes)
@@ -611,6 +650,8 @@ async def monitor_registration(
             logger.error(e)
         except asyncio.CancelledError:
             break
+        except asyncio.TimeoutError:
+            pass
         except Exception as e:
             logger.exception("unexpected error: %s", e, exc_info=1)
             # logger.error("exception caused by this msg: %s", msg_bytes)
@@ -642,7 +683,7 @@ class Rawi:
             Currently active (async) ZeroMQ context
 
         config : ConfigT
-            The co´mponent configuration object
+            The component configuration object
 
         rgstr_info_fn : Callable[None, Scroll]
             A function that returns registration information. It
@@ -662,9 +703,12 @@ class Rawi:
         logger.debug("public key: %s", config.public_key)
 
         self.rgstr_sock = ctx.socket(zmq.ROUTER)
-        self.rgstr_sock.curve_secretkey = config.private_key.encode("ascii")
-        self.rgstr_sock.curve_publickey = config.public_key.encode("ascii")
-        self.rgstr_sock.curve_server = True
+        if self.config.encrypt:
+            self.rgstr_sock.curve_secretkey = config.private_key.encode("ascii")
+            self.rgstr_sock.curve_publickey = config.public_key.encode("ascii")
+            self.rgstr_sock.curve_server = True
+        else:
+            logger.warn("registration socket is NOT ENCRYPTED")
         self.rgstr_sock.bind(config.rgstr_addr)
 
         self.monitor_task = None

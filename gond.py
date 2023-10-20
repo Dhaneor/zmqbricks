@@ -77,10 +77,10 @@ class Gond:
         logger.info("Starting components...")
 
         # heartbeats ...
-        self.tasks.append(asyncio.create_task(self.heart.start()))
+        self.tasks.append(asyncio.create_task(self.heart.start(), name="heartbeats"))
 
         # registration monitoring ...
-        self.tasks.append(asyncio.create_task(self.rawi.start()))
+        self.tasks.append(asyncio.create_task(self.rawi.start(), name="registration"))
 
         # everyone needs to register with the Central Service Registry,
         # except 'Amanya', which is the CSR
@@ -109,6 +109,7 @@ class Gond:
         await self.heart.stop()
 
         for task in self.tasks:
+            logger.debug("cancelling task: %s" % task.get_name())
             task.cancel()
 
         asyncio.gather(*self.tasks, return_exceptions=True)

@@ -3,7 +3,7 @@
 """
 Configuration file basic settings for ZeroMQ components.
 
-This is the place where shared settings can be set.
+This is the place where shared settings can be set!
 
 Created on Fri Oct 06 21:41:23 2023
 

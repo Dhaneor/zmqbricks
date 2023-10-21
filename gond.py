@@ -56,14 +56,16 @@ class Gond:
     heartbeat = hb.Hjarta  # heartbeat sending/monitoring component
     craeft = None  # craeft component (the main task of the component)
 
-    rgstr_info_fn = None  # a function that returns registration information
+    rgstr_info_coro = None  # a function that returns registration information
 
     def __init__(self, config: ConfigT, ctx: Optional[ContextT] = None, **kwargs) -> None:
         self.config = config
         self.ctx = ctx or zmq.asyncio.Context()
 
         self.kinsfolk = kf.Kinsfolk(config.hb_interval, config.hb_liveness)
-        self.heart = self.heartbeat(self.ctx, self.config)
+        self.heart = self.heartbeat(
+            self.ctx, self.config, on_rcv=[self.kinsfolk.update]
+        )
         self.rawi = self.rawi(
             self.ctx, self.config, None, actions=[self.process_registration]
         )
@@ -76,11 +78,12 @@ class Gond:
     async def __aenter__(self):
         logger.info("Starting components...")
 
-        # heartbeats ...
+        # start heartbeat & registration background tasks
         self.tasks.append(asyncio.create_task(self.heart.start(), name="heartbeats"))
-
-        # registration monitoring ...
         self.tasks.append(asyncio.create_task(self.rawi.start(), name="registration"))
+        self.tasks.append(
+            asyncio.create_task(self.kinsfolk.watch_out(), name="kinsfolk")
+        )
 
         # everyone needs to register with the Central Service Registry,
         # except 'Amanya', which is the CSR

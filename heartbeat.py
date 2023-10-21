@@ -63,7 +63,7 @@ from zmqbricks.base_config import ConfigT  # noqa: F401, E402
 from zmqbricks.util.async_timer_with_reset import create_timer  # noqa: F401, E402
 
 logger = logging.getLogger("main.heartbeat")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 # constants
@@ -117,10 +117,16 @@ class HeartbeatMessage:
         Greeting message.
     sequence: int
         Sequence number of the message
+    timestamp: float
+        time when the message was sent, will be set automatically
     payload: Optional[PayloadT]
         Additional payload to send with the heartbeat message.
         This can be a JSON serializable object or a coroutine
         that returns one.
+    encoding: Optional[str]
+        Encoding to be used for this message
+    _sender_id: Optional[bytes]
+        Routing id of the sender, only used for ROUTER sockets.
     """
 
     uid: str
@@ -175,7 +181,6 @@ class HeartbeatMessage:
             socket=socket,
             greeting=msg[msg_start_frame + 3].decode(DEFAULT_ENCODING),
             timestamp=float(msg[msg_start_frame + 4].decode(DEFAULT_ENCODING)),
-
             encoding=DEFAULT_ENCODING,
             _sender_id=sender_id,
         )
@@ -241,6 +246,9 @@ async def recv_hb(
                     await queue.put_nowait((hb_msg.uid, hb_msg.payload))
 
             logger.debug("'%s!' from: %s", hb_msg.greeting, hb_msg.name)
+
+            if not (actions or queues):
+                logger.warning("noone will know about, no actions or queues to publish")
 
         except zmq.ZMQError as e:
             logger.error("ZMQ  error: %s", e)
@@ -404,23 +412,52 @@ class Hjarta:
 
     Hjarta --> Old Norse word for heart.
 
+    Parameters
+    ----------
+    ctx : ContextT
+        An async ZeroMQ context.
+    config : ConfigT
+        Configuration parameters.
+    on_snd : Optional[Sequence[Coroutine]], optional
+        Call these after sending a heartbeat, by default None
+    on_rcv : Optional[Sequence[Coroutine]], optional
+        Call these after receiving a heartbeat, by default None
     """
 
     send: Coroutine[None, None, None] = send_hb
     listen: Coroutine[None, None, None] = recv_hb
 
-    def __init__(self, ctx: ContextT, config: ConfigT):
+    def __init__(
+        self,
+        ctx: ContextT,
+        config: ConfigT,
+        on_snd: Optional[Sequence[Coroutine]] = None,
+        on_rcv: Optional[Sequence[Coroutine]] = None
+    ) -> None:
+        """Initialize a new Hjarta instance.
+
+        Parameters
+        ----------
+        ctx : ContextT
+            An async ZeroMQ context.
+        config : ConfigT
+            Configuration parameters.
+        on_snd : Optional[Sequence[Coroutine]], optional
+            Call these after sending a heartbeat, by default None
+        on_rcv : Optional[Sequence[Coroutine]], optional
+            Call these after receiving a heartbeat, by default None
+        """
         self.ctx = ctx
         self.config = config
-        self.tasks: list = [None, None]
+        self.tasks: list = [None, None]  # send/listen background tasks
 
         self.snd_sock: zmq.Socket = self.ctx.socket(zmq.PUB)
         self.snd_sock.bind(config.hb_addr)
 
         self.rcv_sock = self.ctx.socket(zmq.SUB)
 
-        self.on_snd: list[Coroutine] = []
-        self.on_rcv: list[Coroutine] = []
+        self.on_snd: list[Coroutine] = on_snd or [],
+        self.on_rcv: list[Coroutine] = on_rcv or []
 
         logger.info("Hjarta initialized: OK")
 

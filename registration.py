@@ -3,14 +3,23 @@
 """
 Provides a standardized way to register services with each other.
 
-classes:
+It is possible to use the functions for a functional approach, or
+the Rawi class for OOP style registration.
+
+Classes:
     Scroll
         A standardized registration request message.
 
     RegistrationReply
         A standardized registration reply message
 
-functions:
+    Rawi
+        registration component as class
+
+Functions:
+    register
+        function to register with a particular service
+
     monitor_registration
         A function to monitor a registration socket/port.
         Should use a ROUTER socket!
@@ -30,8 +39,7 @@ from dataclasses import dataclass
 from functools import partial
 from time import time
 from typing import (
-    Coroutine, Optional, Sequence, Mapping, TypeAlias, Callable, Any, TypeVar,
-    NamedTuple
+    Coroutine, Optional, Sequence, Mapping, TypeAlias, Any, NamedTuple, TypeVar
 )
 
 # from zmqbricks.kinsfolk import KinsfolkT
@@ -57,21 +65,16 @@ DEFAULT_RGSTR_LOG_INTERVAL = 900  # log the same message again after (secs)
 DEFAULT_RGSTR_MAX_ERRORS = 10  # maximum number of registration errors
 
 ENCODING = "utf-8"
-TTL = 5  # time-to-live for a scroll (seconds)
+TTL = 10  # time-to-live for a scroll (seconds)
 MAX_LEN_NONCE_CACHE = 1000  # how many nonces to store for comparison
+DEBUG = False  # set this to True for debuggging encrypted registration attempts
 
-
-KinsfolkT = TypeVar("KinsfolkT", bound=Mapping[str, str])
+KinsfolkT = TypeVar("KinsfolkT", bound=dataclass)
 SockT: TypeAlias = zmq.Socket
-# ConfigT: TypeAlias = object
 ContextT: TypeAlias = zmq.asyncio.Context
 
 
 # ======================================================================================
-def exception_handler(loop, context):
-    logger.error("caught EXCEPTION: %s -> %s", context.get("exception"))
-
-
 def get_ttl():
     return int(time() + TTL)
 
@@ -295,7 +298,8 @@ def check_ttl(request):
 
 
 # --------------------------------------------------------------------------------------
-async def process_registration_reply(reply: dict[str, Any]) -> Scroll | None:
+# helper functions
+async def _process_registration_reply(reply: dict[str, Any]) -> Scroll | None:
     """Process the registration reply, return a Scroll, if possible.
 
     Parameters
@@ -305,8 +309,8 @@ async def process_registration_reply(reply: dict[str, Any]) -> Scroll | None:
 
     Returns
     -------
-    tuple | None
-        _description_
+    Scroll
+        An instance of Scroll
 
     Raises
     ------
@@ -315,7 +319,7 @@ async def process_registration_reply(reply: dict[str, Any]) -> Scroll | None:
     """
     # build formalized registration reply from dictionary response
     try:
-        return True, Scroll.from_dict(reply)
+        return Scroll.from_dict(reply)
 
     except (KeyError, AttributeError):
         # let's see if this is an error message, or just garbage
@@ -329,14 +333,22 @@ async def process_registration_reply(reply: dict[str, Any]) -> Scroll | None:
         raise RegistrationError(f"registration: FAIL ({error})")
 
 
-async def call_them_callbacks(actions: Sequence[Coroutine], payload: Any) -> None:
+async def _call_them_callbacks(actions: Sequence[Coroutine], payload: Any) -> None:
+    """Call one or more callbacks with a payload.
+
+    Parameters
+    ----------
+    actions : Sequence[Coroutine]
+        A sequence of callbacks.
+    payload : Any
+        The payload/args/kwargs to pass to the callbacks.
+    """
     for action in actions:
         try:
             logger.info("calling %s", action)
             await action(payload)
         except Exception as e:
-            logger.critical("action failed: %s", action, exc_info=1)
-            raise Exception() from e
+            logger.critical("action failed: %s --> %s", action, e, exc_info=1)
 
 
 async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> dict:
@@ -420,18 +432,23 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
                 # send the request
                 await scroll.send(sock)
 
-                monitor = sock.get_monitor_socket()
+                # activate the DEBUG flag at the top of the file to
+                # see what's going on with encrypted connections
+                if DEBUG:
+                    monitor = sock.get_monitor_socket()
 
-            # ... & wait for an answer, retry if necessary
-                try:
-                    event = await asyncio.wait_for(monitor.recv_multipart(), 2)
-                    parsed = parse_monitor_message(event)
-                    logger.debug("monitor msg: %s", parsed)
-                except asyncio.TimeoutError:
-                    pass
-                except zmq.ZMQError as e:
-                    logger.error("registration monitor -> zmq error: %s", e, exc_info=1)
+                    try:
+                        event = await asyncio.wait_for(monitor.recv_multipart(), 2)
+                        parsed = parse_monitor_message(event)
+                        logger.debug("monitor msg: %s", parsed)
+                    except asyncio.TimeoutError:
+                        pass
+                    except zmq.ZMQError as e:
+                        logger.error(
+                            "registration monitor -> zmq error: %s", e, exc_info=1
+                        )
 
+                # ... & wait for an answer, retry if necessary
                 response = await asyncio.wait_for(sock.recv_json(), TTL)
 
             except ConnectionRefusedError as e:
@@ -459,7 +476,9 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
                 errors += 1
 
             else:
-                logger.debug(f"received reply from collector: {response}")
+                logger.debug(
+                    "received reply from %s: %s", peer_scroll.service_name, response
+                )
                 registered = True
 
             finally:
@@ -476,10 +495,12 @@ async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> d
     return response
 
 
+# --------------------------------------------------------------------------------------
+# main function for registering with a peer kinsman
 async def register(
     ctx: ContextT,
     config: ConfigT,
-    rgstr_info_fn: Callable,
+    rgstr_info_coro: Coroutine,
     actions: Optional[Sequence[Coroutine]] = None
 ) -> Scroll:
     """Register with a peer kinsman.
@@ -492,8 +513,8 @@ async def register(
     config : ConfigT
         this streamers configuration object
 
-    rgstr_info_fn : Callable
-        a function that return the registration information.
+    rgstr_info_coro : Coroutine
+        a coroutine that returns the registration information.
 
     actions : Optional[Sequence[Coroutine]], optional
         coroutines to call after successful registration, default None
@@ -508,19 +529,17 @@ async def register(
     RegistrationError
         if the registration for all possible peers failed
     """
-
     # build formalized registration request
     scroll = Scroll.from_dict(config.as_dict())
-    registered = False
 
-    while not registered:
-
-        # rgstr_info_fn may or may not try to to retrieve updated
+    # try forever or until successful ...
+    while True:
+        # rgstr_info_coro may or may not try to to retrieve updated
         # registration information from the Central Service Registry.
         # This makes no sense if we are trying to initially register
-        # the caller with the CSR. Then rgstr_info_fn should return
+        # the caller with the CSR. Then rgstr_info_coro should return
         # the static information for the Central Service Registry.
-        while not (peer_scroll := await rgstr_info_fn()):
+        while not (peer_scroll := await rgstr_info_coro()):
             asyncio.sleep(10)
 
         logger.info(
@@ -532,28 +551,27 @@ async def register(
 
         try:
             response = await _get_response(ctx, scroll, peer_scroll)
-
-        except ValueError as e:
+            peer_scroll = await _process_registration_reply(response)
+        except ValueError as e:  # missing registration endpoint for peer
             logger.error(e)
-            await asyncio.sleep(5)
-
-        except MaxRetriesReached as e:
+            await asyncio.sleep(10)
+        except MaxRetriesReached as e:  # peer could not be reached
             logger.error(e)
-
+        except RegistrationError as e:  # invalid registration response
+            logger.error(e)
+        except Exception as e:  # unexpected error
+            logger.error(e, exc_info=1)
+            await asyncio.sleep(10)
         else:
-            # build formalized registration reply from dictionary response
-            registered, peer_scroll = await process_registration_reply(response)
-
-            # execute  provided actions with reply, if any
             if actions:
-                await call_them_callbacks(actions, peer_scroll)
+                await _call_them_callbacks(actions, peer_scroll)
 
-            logger.info("===================================================")
+            logger.info("=" * 120)
             logger.info(
                 "registered with %s at %s",
-                peer_scroll.service_name,
-                peer_scroll.endpoints.get("registration"),
+                peer_scroll.service_name, peer_scroll.endpoints.get("registration"),
             )
+            break
 
     return peer_scroll
 
@@ -563,6 +581,7 @@ async def send_reply(
     config: ConfigT,
     kinsfolk: KinsfolkT
 ):
+    """Send a registration reply."""
     reply = Scroll.from_dict(config.as_dict())
 
     await reply.send(socket=req._socket, routing_key=req._routing_key)
@@ -666,13 +685,29 @@ class Rawi:
     """Class that manages registrations for peer kinsman.
 
     rawi --> Arabic for registry
+
+    Parameters
+    ----------
+    ctx : ContextT
+        Currently active (async) ZeroMQ context
+
+    config : ConfigT
+        The component configuration object
+
+    rgstr_info_coro : Coroutine[None, Scroll]
+        A function that returns registration information. It
+        should return a Scroll instance from the peer that this
+        component should register with.
+
+    actions : Optional[Sequence[Coroutine[Scroll, None, None]]], optional
+        Actions to perform after a peer registered with this component.
     """
 
     def __init__(
         self,
         ctx: ContextT,
         config: ConfigT,
-        rgstr_info_fn: Callable,
+        rgstr_info_coro: Coroutine,
         actions: Optional[Sequence[Coroutine[Scroll, None, None]]] = None
     ) -> None:
         """Initialize the Rawi (registration) instance.
@@ -685,7 +720,7 @@ class Rawi:
         config : ConfigT
             The component configuration object
 
-        rgstr_info_fn : Callable[None, Scroll]
+        rgstr_info_coro : Callable[None, Scroll]
             A function that returns registration information. It
             should return a Scroll instance from the peer that this
             component should register with.
@@ -695,7 +730,7 @@ class Rawi:
         """
         self.ctx = ctx
         self.config = config
-        self.rgstr_info_fn = rgstr_info_fn
+        self.rgstr_info_coro = rgstr_info_coro
         self.actions = actions
 
         # configure the registration socket
@@ -731,12 +766,12 @@ class Rawi:
     # ..................................................................................
     async def register_with_service_registry(self, config: ConfigT) -> Scroll | None:
         if config.service_registry is not None:
-            rgstr_info_fn = partial(
-                self.static_rgstr_info_fn,
+            rgstr_info_coro = partial(
+                self.static_rgstr_info_coro,
                 self.config.service_registry
             )
 
-            return await self.register(rgstr_info_fn=rgstr_info_fn, actions=[])
+            return await self.register(rgstr_info_coro=rgstr_info_coro, actions=[])
         else:
             logger.error(
                 "unable to register with Central Service Registry , "
@@ -746,7 +781,7 @@ class Rawi:
     # ..................................................................................
     async def register(
         self,
-        rgstr_info_fn: Optional[Coroutine] = None,
+        rgstr_info_coro: Optional[Coroutine] = None,
         actions: Optional[Sequence[Coroutine]] = None
     ) -> Scroll:
 
@@ -756,7 +791,7 @@ class Rawi:
             return await register(
                 ctx=self.ctx,
                 config=self.config,
-                rgstr_info_fn=rgstr_info_fn or self.static_rgstr_info_fn,
+                rgstr_info_coro=rgstr_info_coro or self.static_rgstr_info_coro,
                 actions=actions
             )
         except RegistrationError as e:
@@ -807,8 +842,24 @@ class Rawi:
             except Exception as e:
                 logger.error("unexpected error: %s", e, exc_info=1)
 
-    async def static_rgstr_info_fn(self, service_registry: dict) -> NamedTuple:
-        """Return static registration information for the Central Service Registry."""
+    async def static_rgstr_info_coro(
+        self,
+        service_registry: dict[str, str]
+    ) -> NamedTuple:
+        """Return static registration information for the Central Service Registry.
+
+        Takes the information about the central service registry from
+        the provided configuration file and returns a NamedTuple that
+        replaces the Scroll class that would normally be used for
+        registrations.
+
+        Parameters
+        ----------
+        servive_registry: dict
+            The central service registry information, must contain:
+            - endpoint: the endpoint of the central service registry
+            - public_key: the public key of the central service registry
+        """
 
         if not isinstance(service_registry, dict):
             raise RegistrationError("service_registry in config must be a dictionary")

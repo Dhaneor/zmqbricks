@@ -34,6 +34,8 @@ class BaseConfig:
 
     hb_interval: float = cnf.HB_INTERVAL  # heartbeat interval (seconds)
     hb_liveness: int = cnf.HB_LIVENESS  # heartbeat liveness (max missed heartbeats)
+
+    rgstr_with_csr: bool = True
     rgstr_timeout: int = cnf.RGSTR_TIMEOUT  # registration timeout (seconds)
     rgstr_max_errors: int = cnf.RGSTR_MAX_ERRORS  # max no of registration errors
     rgstr_log_interval: int = cnf.RGSTR_LOG_INTERVAL  # resend request after (secs)

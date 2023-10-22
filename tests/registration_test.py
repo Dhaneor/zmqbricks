@@ -51,15 +51,13 @@ scroll = reg.Scroll(
 )
 
 config = BaseConfig("kucoin", ["spot"], [])
-config._endpoints = {
-    "registration": "tcp://127.0.0.1:5600",
-    "publisher": "tcp://127.0.0.1:5601"
-}
 config.rgstr_with = ["streamer"]
+config._endpoints = {
+    "registration": "tcp://127.0.0.1:5600", "publisher": "tcp://127.0.0.1:5601"
+}
 
-public, private = curve.generate_curve_key_pair()
 Keys = namedtuple("Keys", ["public", "private"])
-amanya_keys = Keys(public=public, private=private)
+amanya_keys = Keys(*curve.generate_curve_key_pair())
 
 
 class CSR(NamedTuple):

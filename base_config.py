@@ -18,9 +18,14 @@ import requests
 from typing import Sequence, Optional, TypeVar
 from uuid import uuid4
 
-from . import config as cnf
-from .fukujou.curve import generate_curve_key_pair
-from .util.sockets import SockDef
+try:
+    from . import config as cnf
+    from .fukujou.curve import generate_curve_key_pair
+    from .util.sockets import SockDef
+except ImportError:
+    import config as cnf
+    from fukujou.curve import generate_curve_key_pair
+    from util.sockets import SockDef
 
 
 class BaseConfig:
@@ -145,7 +150,3 @@ class BaseConfig:
 
 
 ConfigT = TypeVar("ConfigT", bound=BaseConfig)
-
-
-if __name__ == "__main__":
-    pass

@@ -62,7 +62,7 @@ class Kinsman:
     public_key: Optional[str] = None
     session_key: Optional[str] = None
     certificate: Optional[str] = None
-    status: str = 'active'
+    status: str = "active"
     liveness: Optional[int] = 0
     last_seen: Optional[float] = 0
     last_health_check: Optional[int] = 0
@@ -71,10 +71,7 @@ class Kinsman:
     def __repr__(self) -> str:
         serv_name = self.service_name.upper() if self.service_name else "UNKNOWN"
 
-        return (
-            f"Kinsman {self.name}, Keeper of the {serv_name} "
-            f"({self.liveness})"
-        )
+        return f"Kinsman {self.name}, Keeper of the {serv_name} " f"({self.liveness})"
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -84,7 +81,7 @@ class Kinsman:
 
     @property
     def is_active(self) -> bool:
-        return self.status == 'active'
+        return self.status == "active"
 
     def activate(self) -> None:
         self.status = "active"
@@ -128,7 +125,7 @@ class Kinsfolk:
         hb_interval_seconds: int,
         hb_liveness: int,
         on_inactive_kinsman: Optional[Coroutine] = None,
-        grace_period: int = 86400
+        grace_period: int = 86400,
     ) -> None:
         """Initialize the Kinsfolk.
 
@@ -228,10 +225,7 @@ class Kinsfolk:
         self._kinsfolk[kinsman.identity] = kinsman
 
     async def update(
-        self,
-        identity: str,
-        payload: dict = None,
-        on_missing: Coroutine = None
+        self, identity: str, payload: dict = None, on_missing: Coroutine = None
     ) -> None:
         """Updates the health for the Kinsman with the given identity.
 
@@ -338,9 +332,7 @@ class Kinsfolk:
             return True
 
         # if we get here, the kinsman is at least "inactive"
-        logger.warning(
-            "Thy may mourn the passing of our kinsman  %s!", kinsman.name
-        )
+        logger.warning("Thy may mourn the passing of our kinsman  %s!", kinsman.name)
 
         kinsman.status = "inactive"
 

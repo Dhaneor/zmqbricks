@@ -13,15 +13,17 @@ import time
 import zmq
 import zmq.asyncio
 
+from collections import namedtuple
 from pprint import pprint
 from os.path import dirname as dir
+from typing import NamedTuple
 
 sys.path.append(dir(dir(__file__)))
+sys.path.append(dir(dir(dir(__file__))))
 
 import registration as reg  # noqa: E402
 from base_config import BaseConfig  # noqa E402
-
-# --------------------------------------------------------------------------------------
+from fukujou import curve  # noqa: E402
 
 logger = logging.getLogger('main')
 logger.setLevel(logging.DEBUG)
@@ -34,7 +36,7 @@ handler.setFormatter(formatter)
 
 # --------------------------------------------------------------------------------------
 SEND_ADDR = "inproc://reg_test"
-RECV_ADDR = "inproc://reg_test"
+RECV_ADDR = "tcp://127.0.0.1:8001"   # "inproc://reg_test"
 
 scroll = reg.Scroll(
     uid="jhfs-950746",
@@ -53,6 +55,18 @@ config._endpoints = {
     "registration": "tcp://127.0.0.1:5600",
     "publisher": "tcp://127.0.0.1:5601"
 }
+config.rgstr_with = ["streamer"]
+
+public, private = curve.generate_curve_key_pair()
+Keys = namedtuple("Keys", ["public", "private"])
+amanya_keys = Keys(public=public, private=private)
+
+
+class CSR(NamedTuple):
+    name = "Amanya"
+    public_key = amanya_keys.public
+    endpoints = {"requests": RECV_ADDR}
+    endpoint = RECV_ADDR
 
 
 # ======================================================================================
@@ -97,6 +111,59 @@ async def callback(req: reg.Scroll) -> None:
     logger.info("received request: %s", req)
 
 
+async def mock_csr(ctx: zmq.asyncio.Context) -> None:
+    streamer = BaseConfig("kucoin", ["spot"], [])
+    streamer._endpoints = {
+        "registration": "tcp://127.0.0.1:5600",
+        "publisher": "tcp://127.0.0.1:5601"
+    }
+    streamer.rgstr_with = ["collector"]
+
+    # await asyncio.sleep(12)
+
+    with zmq.asyncio.Socket(ctx, zmq.ROUTER) as sock:
+        sock.curve_secretkey = amanya_keys.private.encode("ascii")
+        sock.curve_publickey = amanya_keys.public.encode("ascii")
+        sock.curve_server = True
+        sock.bind(RECV_ADDR)
+
+        poller = zmq.asyncio.Poller()
+        poller.register(sock, zmq.POLLIN)
+
+        logger.debug("mock CSR started: OK")
+
+        while True:
+            try:
+                events = dict(await poller.poll())
+
+                if events:
+                    logger.debug(events)
+
+                if sock in events:
+                    req = await sock.recv_multipart()
+                    key, msg = req[0], req[1:]
+                    logger.debug("received request: %s" % msg)
+                    await sock.send_multipart(
+                        [
+                            key,
+                            b"ADD",
+                            streamer.as_json().encode(),
+                            streamer.as_json().encode()
+                        ]
+                    )
+            except asyncio.CancelledError:
+                break
+            except zmq.ZMQError as e:
+                logger.error(e, exc_info=1)
+                break
+            except Exception as e:
+                logger.error("unexpected error: %s", e, exc_info=1)
+                break
+
+        logger.debug("mock CSR stopped: OK")
+
+
+# --------------------------------------------------------------------------------------
 async def test_monitor_registration() -> None:
     ctx = zmq.asyncio.Context()
 
@@ -116,6 +183,26 @@ async def test_monitor_registration() -> None:
     monitor.cancel()
 
     await asyncio.gather(monitor)
+
+
+async def test_vigilante():
+    ctx = zmq.asyncio.Context()
+    csr = CSR()
+    csr_task = asyncio.create_task(mock_csr(ctx))
+    v = reg.Vigilante(context=ctx, config=config, csr=csr, on_new=[])
+
+    logger.debug(v)
+
+    await v.get_initial_data()
+
+    await asyncio.sleep(0.1)
+
+    # logger.debug("Vigilante services: %s", v.services)
+
+    csr_task.cancel()
+    v.process_task.cancel()
+
+    await asyncio.gather(*[csr_task, v.process_task])
 
 
 async def test_rawi():
@@ -198,6 +285,6 @@ async def test_rawi():
     await server.stop()
 
 if __name__ == '__main__':
-    asyncio.run(test_rawi())
+    asyncio.run(test_vigilante())
     # test_scroll_ttl()
     # test_scroll_from_config()

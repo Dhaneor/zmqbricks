@@ -56,9 +56,11 @@ class Gond:
     heartbeat = hb.Hjarta  # heartbeat sending/monitoring component
     craeft = None  # craeft component (the main task of the component)
 
-    rgstr_info_coro = None  # a function that returns registration information
+    rgstr_info_coro = None  # a coroutine that returns registration information
 
-    def __init__(self, config: ConfigT, ctx: Optional[ContextT] = None, **kwargs) -> None:
+    def __init__(
+        self, config: ConfigT, ctx: Optional[ContextT] = None, **kwargs
+    ) -> None:
         self.config = config
         self.ctx = ctx or zmq.asyncio.Context()
 

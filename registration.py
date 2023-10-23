@@ -32,11 +32,9 @@ import asyncio
 import json
 import logging
 import zmq
-import inspect
 
 from collections import deque
 from dataclasses import dataclass
-from functools import partial
 from time import time
 from typing import (
     Coroutine,
@@ -242,9 +240,21 @@ class Scroll:
         -------
         Scroll
             The registration request/reply created from the message.
+
+        Raises
+        ------
+        BadScrollError
+            if message is malformed.
         """
-        msg_as_dict = json.loads(msg[1].decode(ENCODING))
-        msg_as_dict["_routing_key"] = msg[0]
+        if len(msg) == 2:
+            msg_as_dict = json.loads(msg[1].decode(ENCODING))
+            msg_as_dict["_routing_key"] = msg[0]
+        elif len(msg) == 1:
+            msg_as_dict = json.loads(msg.decode(ENCODING))
+        else:
+            raise BadScrollError(
+                "unable to create Scroll from msg of length %s" % len(msg)
+            )
 
         if reply_socket:
             msg_as_dict["_socket"] = reply_socket
@@ -412,6 +422,7 @@ async def register(
     config: ConfigT,
     rgstr_info_coro: Coroutine,
     actions: Optional[Sequence[Coroutine]] = None,
+    try_forever: Optional[bool] = False
 ) -> Scroll:
     """Register with a peer kinsman.
 
@@ -428,6 +439,9 @@ async def register(
 
     actions : Optional[Sequence[Coroutine]], optional
         coroutines to call after successful registration, default None
+
+    try_forever : bool, optional
+        try forever or until successful, default False
 
     Returns
     -------
@@ -455,12 +469,12 @@ async def register(
         logger.info(
             "... registering with %s - at %s (public key: %s)",
             peer_scroll.service_name,
-            peer_scroll.endpoint,
+            peer_scroll.endpoints.get("registration"),
             peer_scroll.public_key,
         )
 
         try:
-            response = await one_time_request(ctx, scroll, peer_scroll)
+            response = await one_time_request(ctx, scroll, peer_scroll, "registration")
             peer_scroll = await process_rgstr_reply(await decode_rgstr_reply(response))
         except ValueError as e:  # missing registration endpoint for peer
             logger.error(e)
@@ -479,10 +493,13 @@ async def register(
             logger.info("=" * 120)
             logger.info(
                 "registered with %s at %s",
-                peer_scroll.service_name,
-                peer_scroll.endpoints.get("registration"),
+                peer_scroll.service_name, peer_scroll.endpoints.get("registration"),
             )
             break
+        finally:
+            if not try_forever:
+                peer_scroll = None
+                break
 
     return peer_scroll
 
@@ -532,52 +549,6 @@ async def send_reply_fail(scroll: Scroll, error: Optional[str] = None) -> None:
 
 
 # --------------------------------------------------------------------------------------
-async def process_registration(
-    scroll: ScrollT, config: ConfigT, on_rcv: Coroutine, reply: bool = True
-) -> None:
-    """Process a new registration.
-
-    This method is used when a Kinsman registers with us, and when we
-    get a repsonse to our registration request -> reply: True/False.
-
-    Parameters
-    ----------
-    scroll : rgstr.Scroll
-        Scroll instance containing the peer information.
-    """
-    logger.info("processing registration for %s, %s", scroll.name, scroll.service_type)
-    logger.debug("will send reply: %s" % reply)
-    caller = inspect.stack()[0][1]
-    logger.debug("calling function: %s" % caller)
-
-    try:
-        await on_rcv(scroll)
-        error = None
-
-    except BadScrollError as e:
-        logger.error("bad scroll: %s -> %s", scroll, e)
-
-    except KeyError as e:
-        logger.error("no heartbeat endpoint in scroll: %s -> %s", scroll, e)
-        error = "bad heartbeat endpoint"
-
-    except zmq.ZMQError as e:
-        logger.error("ZMQ error while connecting to endpoint: %s", e)
-
-    except Exception as e:
-        logger.error("unexpected error: %s", e, exc_info=1)
-        error = f"unexpected error: {e}"
-
-    else:
-        if reply:
-            logger.debug("sending reply to %s", scroll.name)
-            await send_reply_ok(scroll=scroll, config=config)
-
-    finally:
-        if error:
-            await send_reply_fail(scroll=scroll, error=error)
-
-
 async def monitor_registration(
     socket: zmq.Socket,
     callbacks: Optional[Sequence[Coroutine]] = None,
@@ -604,16 +575,6 @@ async def monitor_registration(
 
     while True:
         try:
-            # try:
-            #     event = await asyncio.wait_for(monitor.recv_multipart(), 2)
-            #     parsed = parse_monitor_message(event)
-            #     logger.debug("monitor msg: %s", parsed)
-            # except asyncio.TimeoutError:
-            #     pass
-            # except zmq.ZMQError as e:
-            #     logger.error("registration monitor -> zmq error: %s", e, exc_info=1)
-            #     break
-
             msg_bytes = await socket.recv_multipart()
 
             logger.debug("received msg: %s", msg_bytes)
@@ -646,6 +607,8 @@ async def monitor_registration(
         except zmq.ZMQError as e:
             logger.error("registration monitor -> zmq error: %s", e, exc_info=1)
             break
+        except BadScrollError as e:
+            logger.error("bad scroll: %s -> %s", request, e)
         except EmptyMessageError:
             # can happen when clients need to wait the receiver
             # to come back online ... not important
@@ -682,30 +645,44 @@ class Vigilante:
         self.csr = csr
         self.on_new = on_new or []
 
-        self.services = []
+        self.services = []  # local services registry
         self.pending = asyncio.Queue()
-        self.on_new = on_new or []
-        public_key, private_key = generate_curve_key_pair()
-        self.initialized = False
 
-        # configure subscriber socket
-        self.subscriber = context.socket(zmq.SUB)
-        self.subscriber.curve_secretkey = private_key.encode("ascii")
-        self.subscriber.curve_publickey = public_key.encode("ascii")
-        self.subscriber.curve_serverkey = csr.public_key.encode("ascii")
-        self.subscriber.connect(csr.endpoints.get("requests"))
-
-        self.process_task = asyncio.create_task(self.process_update())
+        self.tasks = []
+        self.initialized = False  # set to True when we have initial data
 
     async def start(self) -> None:
-        for service_type in self.config.rgstr_with:
-            self.subscriber.setsockopt(zmq.SUBSCRIBE, service_type.encode())
+        self.tasks = [
+            asyncio.create_task(self.monitor_updates()),
+            asyncio.create_task(self.get_initial_data()),
+            asyncio.create_task(self.process_update()),
+        ]
+        logger.info("CSR agent started: OK")
+
+    async def stop(self) -> None:
+        for task in self.tasks:
+            task.cancel()
+
+        await asyncio.gather(*self.tasks)
+
+        csr_monitor.close(0)
+        logger.info("CSR agent stopped: OK")
+
+    async def monitor_updates(self) -> None:
+        # configure subscriber socket
+        public_key, private_key = generate_curve_key_pair()
+        csr_monitor = self.ctx.socket(zmq.SUB)
+        csr_monitor.curve_secretkey = private_key.encode("ascii")
+        csr_monitor.curve_publickey = public_key.encode("ascii")
+        csr_monitor.curve_serverkey = self.csr.public_key.encode("ascii")
+        csr_monitor.connect(self.csr.endpoints.get("publisher"))
+        csr_monitor.setsockopt(zmq.SUBSCRIBE, b"")
+
+        logger.info("monitor CSR updates started: OK")
 
         while True:
             try:
-                msg_bytes = await self.subscriber.recv_multipart()
-                await self.pending.put_nowait(msg_bytes)
-
+                self.pending.put_nowait(await csr_monitor.recv_multipart())
             except asyncio.CancelledError:
                 break
             except zmq.ZMQError as e:
@@ -715,13 +692,36 @@ class Vigilante:
             except Exception as e:
                 logger.exception("unexpected error: %s", e, exc_info=1)
 
-        logger.info("CSR agent stopped: OK")
+        logger.info("monitor CSR updates stopped: OK")
 
     async def get_initial_data(self):
         for service_type in self.config.rgstr_with:
-            logger.info("requesting service type '%s' from CSR" % service_type)
-            client = ServiceInfoRequest(service_type)
-            await self.pending.put(await one_time_request(self.ctx, client, self.csr))
+            if service_type == "csr":
+                continue
+
+            while True:
+                try:
+                    logger.info("requesting service type '%s' from CSR" % service_type)
+
+                    await self.pending.put(
+                        await one_time_request(
+                            ctx=self.ctx,
+                            client=ServiceInfoRequest(service_type),
+                            server=self.csr,
+                            endpoint="requests"
+                        )
+                    )
+                except BadScrollError as e:
+                    logger.error(
+                        "unable to get service info for '%s' --> %s" % service_type, e
+                    )
+                except MaxRetriesReached as e:
+                    logger.error(e)
+                except Exception as e:
+                    logger.error("unexpected error: %s", e, exc_info=1)
+                    await asyncio.sleep(5)
+                else:
+                    break
 
         self.initialized = True
         logger.debug("CSR agent initialized: OK")
@@ -730,13 +730,18 @@ class Vigilante:
         while not self.initialized:
             await asyncio.sleep(0.1)
 
-        logger.info("=" * 80)
         logger.info("starting to process updates from CSR ...")
 
         while True:
             try:
                 msg_bytes = await self.pending.get()
                 command, data = msg_bytes[0].decode(), msg_bytes[1:]
+
+                logger.debug("received msg: %s \n %s", command, data)
+
+                if not data or data[0] == b"":
+                    logger.critical("got empty service info from CSR")
+                    continue
 
                 for elem in data:
                     decoded = json.loads(elem.decode())
@@ -750,14 +755,19 @@ class Vigilante:
                         await self.remove_service(scroll)
                     else:
                         logger.warning("unexpected command: %s" % command)
+
             except asyncio.CancelledError:
                 break
             except zmq.ZMQError as e:
                 logger.error("csr_agent -> zmq error: %s", e, exc_info=1)
+            except KeyError as e:
+                logger.error("unable to build scroll from dict: %s", e, exc_info=1)
             except BadScrollError as e:
                 logger.error(e)
             except Exception as e:
                 logger.exception("unexpected error: %s", e, exc_info=1)
+
+        logger.info("process CSR updates stopped: OK")
 
     async def add_service(self, scroll: Scroll) -> None:
         if scroll not in self.services:
@@ -770,9 +780,6 @@ class Vigilante:
         self.services.remove(scroll)
 
 
-# ======================================================================================
-#                                Registration OOP style                                #
-# ======================================================================================
 class Rawi:
     """Class that manages registrations for peer kinsman.
 
@@ -819,6 +826,9 @@ class Rawi:
 
         actions : Optional[Sequence[Coroutine[Scroll, None, None]]], optional
             Actions to perform after a peer registered with this component.
+
+        on_rcv : Coroutine
+
         """
         self.ctx = ctx
         self.config = config
@@ -826,7 +836,8 @@ class Rawi:
         self.on_rcv = on_rcv
 
         self.rgstr_sock: SockT = None
-        self.monitor_task = None
+        self.tasks: list = []
+        self.vigilante: Vigilante | None = None
 
         logger.debug("Rawi instance created")
 
@@ -835,8 +846,8 @@ class Rawi:
         """Start the Rawi instance"""
         self.rgstr_sock = await get_rgstr_sock(self.ctx, self.config)
 
-        self.monitor_task = asyncio.create_task(
-            monitor_registration(self.rgstr_sock, [self.on_rcv])
+        self.tasks.append(
+            asyncio.create_task(monitor_registration(self.rgstr_sock, [self.on_rcv]))
         )
 
         # register with the Central Service Registry (Amanya)
@@ -845,16 +856,25 @@ class Rawi:
             await self.on_rcv(peer_scroll, reply=False)
             logger.info("registered with CSR: OK")
 
+            self.vigilante = Vigilante(self.ctx, self.config, peer_scroll, [])
+            await self.vigilante.start()
+
     async def stop(self):
         """Stop the Rawi instance"""
-        if self.monitor_task:
-            self.monitor_task.cancel()
+        if self.vigilante is not None:
+            await self.vigilante.stop()
 
-        self.rgstr_sock.close(0)
+        for task in self.tasks:
+            task.cancel()
+
+        await asyncio.gather(*self.tasks)
+
+        if self.rgstr_sock is not None:
+            self.rgstr_sock.close(0)
 
     # ..................................................................................
     async def register_with_service_registry(self, config: ConfigT) -> Scroll | None:
-        if "csr" not in self.config.rgstr_with:
+        if not self.config.rgstr_with or "csr" not in self.config.rgstr_with:
             return None
 
         if config.service_registry is None:
@@ -866,9 +886,12 @@ class Rawi:
 
         logger.debug("Starting registration with CSR...")
 
-        return await self.register(
-            rgstr_info_coro=partial(self.rgstr_bootstrap, self.config.service_registry),
+        return await register(
+            ctx=self.ctx,
+            config=config,
+            rgstr_info_coro=self.rgstr_bootstrap,
             actions=[],
+            try_forever=True
         )
 
     # ..................................................................................
@@ -877,21 +900,19 @@ class Rawi:
         rgstr_info_coro: Optional[Coroutine] = None,
         actions: Optional[Sequence[Coroutine]] = None,
     ) -> Scroll:
-        logger.info("Registering ...")
-
         try:
             return await register(
                 ctx=self.ctx,
                 config=self.config,
                 rgstr_info_coro=rgstr_info_coro or self.rgstr_bootstrap,
-                actions=actions,
+                actions=actions
             )
         except RegistrationError as e:
             logger.critical(e)
         except Exception as e:
             logger.critical("unexpected error: %s", e, exc_info=1)
 
-    async def rgstr_bootstrap(self, service_registry: dict[str, str]) -> NamedTuple:
+    async def rgstr_bootstrap(self) -> NamedTuple:
         """Return static registration information for the Central Service Registry.
 
         Takes the information about the central service registry from
@@ -906,24 +927,17 @@ class Rawi:
             - endpoint: the endpoint of the central service registry
             - public_key: the public key of the central service registry
         """
-
-        if not isinstance(service_registry, dict):
-            raise RegistrationError("service_registry in config must be a dictionary")
-
-        if "endpoint" not in service_registry:
-            raise RegistrationError("service_registry in config, missing: 'endpoint'")
-
         class StaticRegistrationInfo(NamedTuple):
             name: str
             service_name: str
-            endpoint: str
+            endpoints: dict
             public_key: str
 
-        rgstr_endpoint = service_registry.get("endpoint", None)
+        rgstr_endpoint = self.config.service_registry.get("endpoint", None)
 
         return StaticRegistrationInfo(
             name="Amanya",
             service_name="Central Service Registry",
-            endpoint=rgstr_endpoint,
-            public_key=service_registry.get("public_key", None),
+            endpoints={"registration": rgstr_endpoint},
+            public_key=self.config.service_registry.get("public_key", None),
         )

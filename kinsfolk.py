@@ -28,20 +28,8 @@ from typing import Optional, Mapping, Sequence, Coroutine, TypeVar
 from .registration import Scroll
 from .exceptions import BadScrollError
 
-
-if __name__ == "__main__":
-    logger = logging.getLogger(__name__)
-    ch = logging.StreamHandler()
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s.%(funcName)s.%(lineno)d  - [%(levelname)s]: %(message)s"
-    )
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
-    logger.setLevel(logging.INFO)
-else:
-    logger = logging.getLogger("main.kinsfolk")
-    logger.setLevel(logging.DEBUG)
-
+logger = logging.getLogger("main.kinsfolk")
+logger.setLevel(logging.INFO)
 
 GRACE_PERIOD = 86400  # delete inactive kinsman after x seconds
 
@@ -115,6 +103,25 @@ class Kinsman:
             last_seen=now,
             last_health_check=now,
         )
+
+    def to_scroll(self) -> Scroll:
+        """Get a Scroll representation of this Kinsman."""
+        return Scroll(
+            uid=self.identity,
+            name=self.name,
+            service_name=self.service_name,
+            service_type=self.service_type,
+            endpoints=self.endpoints,
+            exchange=self.exchange,
+            markets=self.markets,
+            description=self.description,
+            public_key=self.public_key,
+            session_key=self.session_key,
+            certificate=self.certificate,
+        )
+
+
+KinsmanT = TypeVar("KinsmanT", bound=Kinsman)
 
 
 class Kinsfolk:
@@ -214,7 +221,7 @@ class Kinsfolk:
 
         logger.debug("watching out done")
 
-    async def get_all(self, service_type: str) -> "Kinsfolk":
+    async def get_all(self, service_type: str) -> list[KinsmanT]:
         return [
             k for k in self.active_kinsmen.values() if k.service_type == service_type
         ]
@@ -350,5 +357,4 @@ class Kinsfolk:
         return False
 
 
-KinsmanT = TypeVar("KinsmanT", bound=Kinsman)
 KinsfolkT = TypeVar("KinsfolkT", bound=Kinsfolk)

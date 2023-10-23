@@ -14,7 +14,7 @@ from typing import TypeAlias, TypeVar
 from zmq.utils.monitor import parse_monitor_message
 
 from zmqbricks.fukujou.curve import generate_curve_key_pair
-from zmqbricks.exceptions import MaxRetriesReached
+from zmqbricks.exceptions import MaxRetriesReached, BadScrollError
 
 ContextT: TypeAlias = zmq.asyncio.Context
 ScrollT = TypeVar("ScrollT", bound=object)
@@ -29,7 +29,9 @@ TTL = 10  # time-to-live for a scroll (seconds)
 DEBUG = False  # set this to True for debuggging encrypted registration attempts
 
 
-async def one_time_request(ctx: ContextT, client: ScrollT, server: ScrollT):
+async def one_time_request(
+    ctx: ContextT, client: ScrollT, server: ScrollT, endpoint: str
+):
     """Send a one-time request to specific peer/server.
 
     NOTE: We need to consider the possibility that our
@@ -64,7 +66,7 @@ async def one_time_request(ctx: ContextT, client: ScrollT, server: ScrollT):
 
     Raises
     ------
-    ValueError
+    BadScrollError
         if the provided server scroll has no registration endpoint attribute
     MaxRetriesReached
         raises after MAX_ERRORS errors/timeouts
@@ -74,8 +76,8 @@ async def one_time_request(ctx: ContextT, client: ScrollT, server: ScrollT):
     response, errors, last_log = None, 0, time() - LOG_INTERVAL
     srv_name, srv_pubkey = server.name, server.public_key
 
-    if not (srv_endpoint := server.endpoint):
-        raise ValueError(f"no endpoint found for {srv_name}")
+    if not (srv_endpoint := server.endpoints.get(endpoint)):
+        raise BadScrollError(f"no endpoint found for {srv_name}")
 
     # good luck!
     while True:

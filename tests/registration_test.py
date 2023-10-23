@@ -191,16 +191,15 @@ async def test_vigilante():
 
     logger.debug(v)
 
+    await v.start()
     await v.get_initial_data()
 
     await asyncio.sleep(0.1)
 
     # logger.debug("Vigilante services: %s", v.services)
-
+    await v.stop()
     csr_task.cancel()
-    v.process_task.cancel()
-
-    await asyncio.gather(*[csr_task, v.process_task])
+    await asyncio.gather(csr_task)
 
 
 async def test_rawi():

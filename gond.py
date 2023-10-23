@@ -45,6 +45,10 @@ ConfigT = TypeVar("ConfigT", bound=cnf.BaseConfig)
 ContextT = TypeVar("ContextT", bound=zmq.asyncio.Context)
 
 
+async def exc_handler(event):
+    logger.critical("Unhandled exception: %s", event, exc_info=1)
+
+
 # ======================================================================================
 class Gond:
     """Skeleton class for components in the data sources/analysis framework.
@@ -77,6 +81,9 @@ class Gond:
 
     async def __aenter__(self):
         logger.info("Starting components...")
+
+        loop = asyncio.get_event_loop()
+        loop.set_exception_handler(exc_handler)
 
         # start heartbeat & registration background tasks
         self.tasks = [

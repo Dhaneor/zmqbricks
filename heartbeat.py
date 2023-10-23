@@ -59,6 +59,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Optional, Sequence, Callable, Mapping, Any, TypeVar, Coroutine
 
+from zmqbricks.kinsfolk import Kinsman, KinsmanT  # noqa: F401, E402
 from zmqbricks.base_config import ConfigT  # noqa: F401, E402
 from zmqbricks.util.async_timer_with_reset import create_timer  # noqa: F401, E402
 
@@ -455,6 +456,7 @@ class Hjarta:
         self.snd_sock.bind(config.hb_addr)
 
         self.rcv_sock = self.ctx.socket(zmq.SUB)
+        self.rcv_sock.setsockopt(zmq.SUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
 
         self.on_snd: list[Coroutine] = on_snd or [],
         self.on_rcv: list[Coroutine] = on_rcv or []
@@ -493,14 +495,45 @@ class Hjarta:
         endpoint : str
            endoint address
         """
-        self.rcv_sock.connect(endpoint)
-        self.rcv_sock.setsockopt(zmq.SUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
-        logger.info('Started listening to %s: OK', endpoint)
+        try:
+            self.rcv_sock.connect(endpoint)
+            logger.info('Started listening to %s: OK', endpoint)
+        except zmq.ZMQError as e:
+            logger.error("ZMQ error: %s", e)
+        except Exception as e:
+            logger.error("unexpected error: %s", e)
 
     async def stop_listening_to(self, endpoint: str) -> None:
-        self.rcv_sock.setsockopt(zmq.UNSUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
-        self.rcv_sock.disconnect(endpoint)
-        logger.info('Stopped listening to %s: OK', endpoint)
+        # self.rcv_sock.setsockopt(zmq.UNSUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
+        try:
+            self.rcv_sock.disconnect(endpoint)
+            logger.info('Stopped listening to %s: OK', endpoint)
+        except zmq.ZMQError as e:
+            logger.error("ZMQ error: %s", e)
+        except Exception as e:
+            logger.error("unexpected error: %s", e)
+
+    async def add_hb_sender(self, kinsman: KinsmanT) -> None:
+        """Add a new sender to the Hjarta instance.
+
+        Parameters
+        ----------
+        kinsman : KinsmanT
+            A Kinsman instance.
+        """
+        logger.debug("starting to listen to %s", kinsman.name)
+        await self.listen_to(kinsman.endpoints.get("heartbeat", ""))
+
+    async def remove_hb_sender(self, kinsman: KinsmanT) -> None:
+        """Remove a sender from the Hjarta instance.
+
+        Parameters
+        ----------
+        kinsman : KinsmanT
+            A Kinsman instance.
+        """
+        logger.debug("stopping to listen to %s", kinsman.name)
+        await self.stop_listening_to(kinsman.endpoints.get("heartbeat", ""))
 
     async def reset_timer(self):
         logger.debug("resetting heartbeat timer...")

@@ -21,9 +21,9 @@ ScrollT = TypeVar("ScrollT", bound=object)
 
 logger = logging.getLogger("main.one_time_request")
 
-DEFAULT_RGSTR_TIMEOUT = 10  # seconds
-DEFAULT_RGSTR_LOG_INTERVAL = 900  # log the same message again after (secs)
-DEFAULT_RGSTR_MAX_ERRORS = 10  # maximum number of registration errors
+
+LOG_INTERVAL = 900  # log the same message again after (secs)
+MAX_ERRORS = 10  # maximum number of registration errors
 
 TTL = 10  # time-to-live for a scroll (seconds)
 DEBUG = False  # set this to True for debuggging encrypted registration attempts
@@ -67,11 +67,11 @@ async def one_time_request(ctx: ContextT, client: ScrollT, server: ScrollT):
     ValueError
         if the provided server scroll has no registration endpoint attribute
     MaxRetriesReached
-        raises after DEFAULT_RGSTR_MAX_ERRORS errors/timeouts
+        raises after MAX_ERRORS errors/timeouts
     """
 
     # prepare variables
-    response, errors, last_log = None, 0, time() - DEFAULT_RGSTR_LOG_INTERVAL
+    response, errors, last_log = None, 0, time() - LOG_INTERVAL
     srv_name, srv_pubkey = server.name, server.public_key
 
     if not (srv_endpoint := server.endpoint):
@@ -82,7 +82,7 @@ async def one_time_request(ctx: ContextT, client: ScrollT, server: ScrollT):
         now, time_out_after_error = time(), TTL + 2**errors
 
         # send the registration request
-        if log_it := now > last_log + DEFAULT_RGSTR_LOG_INTERVAL:
+        if log_it := now > last_log + LOG_INTERVAL:
             logger.info("... sending request to %s", server)
 
         with zmq.asyncio.Socket(ctx, zmq.DEALER) as sock:
@@ -145,9 +145,9 @@ async def one_time_request(ctx: ContextT, client: ScrollT, server: ScrollT):
                 return response
 
             finally:
-                if not response and errors > DEFAULT_RGSTR_MAX_ERRORS:
+                if not response and errors > MAX_ERRORS:
                     raise MaxRetriesReached(
                         "... unable to reach {}r {} after {} errors"
-                        .format(srv_name, srv_endpoint, DEFAULT_RGSTR_MAX_ERRORS)
+                        .format(srv_name, srv_endpoint, MAX_ERRORS)
                     )
                 last_log = now

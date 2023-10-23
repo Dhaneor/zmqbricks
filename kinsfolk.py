@@ -259,7 +259,9 @@ class Kinsfolk:
             if on_missing:
                 await on_missing(identity)
 
-    async def accept(self, scroll: Scroll) -> bool:
+    async def accept(
+        self, scroll: Scroll, on_success: Optional[Coroutine] = None
+    ) -> bool:
         """Accepts a new Kinsman to the Kinsfolk
 
         Parameters
@@ -271,6 +273,11 @@ class Kinsfolk:
         -------
         bool
             Accepted, yes or not.
+
+        Raises
+        ------
+        BadScrollError
+            if the scroll is not valid / could not be processed
         """
         if scroll.uid in self._kinsfolk:
             logger.warning(
@@ -294,6 +301,7 @@ class Kinsfolk:
             logger.error(f"unexpected error creating a Kinsman: {e}")
             raise BadScrollError() from e
         else:
+            await on_success(scroll)
             return True
 
     def check_health(self) -> None:
@@ -342,4 +350,5 @@ class Kinsfolk:
         return False
 
 
+KinsmanT = TypeVar("KinsmanT", bound=Kinsman)
 KinsfolkT = TypeVar("KinsfolkT", bound=Kinsfolk)

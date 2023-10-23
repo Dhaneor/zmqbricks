@@ -30,13 +30,14 @@ import logging
 import zmq
 import zmq.asyncio
 
-from typing import TypeVar, Optional
+from asyncio import create_task
+from functools import partial
+from typing import TypeVar
 
 from . import kinsfolk as kf
 from . import registration as rgstr
 from . import heartbeat as hb
 from . import base_config as cnf
-from . import exceptions as exc
 
 logger = logging.getLogger("main.gond")
 
@@ -51,28 +52,25 @@ class Gond:
     This is to be used as a context manager!
     """
 
-    kinsfolk = kf.Kinsfolk  # kinsfolk registry component
-    rawi = rgstr.Rawi  # registration monitor component
-    heartbeat = hb.Hjarta  # heartbeat sending/monitoring component
-    craeft = None  # craeft component (the main task of the component)
-
-    rgstr_info_coro = None  # a coroutine that returns registration information
-
-    def __init__(
-        self, config: ConfigT, ctx: Optional[ContextT] = None, **kwargs
-    ) -> None:
-        self.config = config
-        self.ctx = ctx or zmq.asyncio.Context()
+    def __init__(self, config: ConfigT, ctx: ContextT, **kwargs) -> None:
+        self.tasks: list = []
 
         self.kinsfolk = kf.Kinsfolk(config.hb_interval, config.hb_liveness)
-        self.heart = self.heartbeat(
-            self.ctx, self.config, on_rcv=[self.kinsfolk.update]
-        )
-        self.rawi = self.rawi(
-            self.ctx, self.config, None, actions=[self.process_registration]
+        self.heart = hb.Hjarta(ctx, config, on_rcv=[self.kinsfolk.update])
+        self.kinsfolk.on_inactive_kinsman = self.heart.remove_hb_sender
+
+        kf_accept_coro = partial(
+            self.kinsfolk.accept,
+            on_success=self.heart.add_hb_sender
         )
 
-        self.tasks: list = []
+        process_rgstr_coro = partial(
+            rgstr.process_registration,
+            config=config,
+            on_rcv=kf_accept_coro
+        )
+
+        self.rawi = rgstr.Rawi(ctx, config, None, on_rcv=process_rgstr_coro)
 
     def __repr__(self) -> str:
         return f"Gond(config={vars(self.config)})"
@@ -81,29 +79,11 @@ class Gond:
         logger.info("Starting components...")
 
         # start heartbeat & registration background tasks
-        self.tasks.append(asyncio.create_task(self.heart.start(), name="heartbeats"))
-        self.tasks.append(asyncio.create_task(self.rawi.start(), name="registration"))
-        self.tasks.append(
-            asyncio.create_task(self.kinsfolk.watch_out(), name="kinsfolk")
-        )
-
-        # everyone needs to register with the Central Service Registry,
-        # except 'Amanya', which is the CSR
-        logger.debug("service_type: %s", self.config.service_type)
-
-        if not self.config.service_type == "amanya":
-            logger.debug("Starting registration with CSR...")
-
-            peer_scroll = await self.rawi.register_with_service_registry(self.config)
-
-            if peer_scroll:
-                logger.debug("finishing registration with CSR")
-                await self.process_registration(peer_scroll, reply=False)
-                logger.info("registered with CSR: OK")
-        else:
-            logger.info(
-                "skipping registration with CSR for %s" % self.config.service_type
-            )
+        self.tasks = [
+            create_task(self.heart.start(), name="heartbeats"),
+            create_task(self.rawi.start(), name="registration"),
+            create_task(self.kinsfolk.watch_out(), name="kinsfolk")
+        ]
 
         return self
 
@@ -117,46 +97,4 @@ class Gond:
             logger.debug("cancelling task: %s" % task.get_name())
             task.cancel()
 
-        asyncio.gather(*self.tasks, return_exceptions=True)
-
-    async def process_registration(self, scroll: rgstr.Scroll, reply=True) -> None:
-        """Process a new registration.
-
-        This method is used when a Kinsman registers with us, and when we
-        get a repsonse to our registration request -> reply: True/False.
-
-        Parameters
-        ----------
-        scroll : rgstr.Scroll
-            Scroll instance containing the peer information.
-        """
-        logger.info(
-            "processing registration for %s, %s", scroll.name, scroll.service_type
-        )
-
-        try:
-            if await self.kinsfolk.accept(scroll):
-                await self.heart.listen_to(scroll.endpoints.get("heartbeat", None))
-            error = None
-
-        except exc.BadScrollError as e:
-            logger.error("bad scroll: %s -> %s", scroll, e)
-            error = "bad scroll"
-
-        except KeyError as e:
-            logger.error("no heartbeat endpoint in scroll: %s -> %s", scroll, e)
-            error = "bad heartbeat endpoint"
-
-        except zmq.ZMQError as e:
-            logger.error("ZMQ error while connecting to endpoint: %s", e)
-
-        except Exception as e:
-            logger.error("unexpected error: %s", e, exc_info=1)
-            error = f"unexpected error: {e}"
-
-        finally:
-            if not reply:
-                logger.debug("not replying to %s", scroll.name)
-                return
-
-            await self.rawi.send_reply(scroll=scroll, config=self.config, error=error)
+        await asyncio.gather(*self.tasks, return_exceptions=True)

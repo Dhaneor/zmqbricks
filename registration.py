@@ -32,14 +32,21 @@ import asyncio
 import json
 import logging
 import zmq
-from zmq.utils.monitor import parse_monitor_message
+import inspect
 
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
 from time import time
 from typing import (
-    Coroutine, Optional, Sequence, Mapping, TypeAlias, Any, NamedTuple, TypeVar,
+    Coroutine,
+    Optional,
+    Sequence,
+    Mapping,
+    TypeAlias,
+    Any,
+    NamedTuple,
+    TypeVar,
 )
 
 from zmqbricks.request import one_time_request
@@ -47,8 +54,14 @@ from zmqbricks.fukujou.nonce import Nonce
 from zmqbricks.fukujou.curve import generate_curve_key_pair
 from zmqbricks.base_config import ConfigT
 from zmqbricks.exceptions import (
-    MissingTtlError, ExpiredTtlError, MissingNonceError, DuplicateNonceError,
-    EmptyMessageError, RegistrationError, MaxRetriesReached, BadScrollError,
+    MissingTtlError,
+    ExpiredTtlError,
+    MissingNonceError,
+    DuplicateNonceError,
+    EmptyMessageError,
+    RegistrationError,
+    MaxRetriesReached,
+    BadScrollError,
 )
 
 logger = logging.getLogger("main.registration")
@@ -246,7 +259,36 @@ class Scroll:
 ScrollT = TypeVar("ScrollT", bound=Scroll)
 
 
+@dataclass
+class ServiceInfoRequest:
+    """A service info request (for use with one_time_request)."""
+
+    service_type: str
+
+    async def send(self, socket):
+        socket.send_multipart([self.service_type.encode()])
+
+
+async def get_rgstr_sock(ctx: ContextT, config: ConfigT) -> SockT:
+    logger.info("configuring registration socket at %s", config.rgstr_addr)
+    logger.debug("public key: %s", config.public_key)
+
+    rgstr_sock = ctx.socket(zmq.ROUTER)
+
+    if config.encrypt:
+        rgstr_sock.curve_secretkey = config.private_key.encode("ascii")
+        rgstr_sock.curve_publickey = config.public_key.encode("ascii")
+        rgstr_sock.curve_server = True
+    else:
+        logger.warn("registration socket is NOT ENCRYPTED")
+
+    rgstr_sock.bind(config.rgstr_addr)
+
+    return rgstr_sock
+
+
 # --------------------------------------------------------------------------------------
+# registration monitor helper functions
 def check_nonce(request, nonces):
     """Check if a nonce is valid.
 
@@ -299,8 +341,14 @@ def check_ttl(request):
 
 
 # --------------------------------------------------------------------------------------
-# helper functions
-async def _process_registration_reply(reply: dict[str, Any]) -> Scroll | None:
+# registration helper functions
+async def decode_rgstr_reply(reply: bytes | list[bytes]) -> dict[str, Any]:
+    if isinstance(reply, list):
+        reply = reply[0]
+    return json.loads(reply.decode())
+
+
+async def process_rgstr_reply(reply: dict[str, Any]) -> Scroll | None:
     """Process the registration reply, return a Scroll, if possible.
 
     Parameters
@@ -329,8 +377,13 @@ async def _process_registration_reply(reply: dict[str, Any]) -> Scroll | None:
             logger.critical("registration not accepted by peer: %e", error)
         else:
             error = "invalid response"
-            logger.critical("invalid reply from collector: %s", reply)
+            logger.critical("invalid registration reply: %s", reply)
 
+    except Exception as e:
+        logger.error("unexpected error while processing reply", e, exc_info=1)
+        error = e
+
+    else:
         raise RegistrationError(f"registration: FAIL ({error})")
 
 
@@ -352,146 +405,6 @@ async def _call_them_callbacks(actions: Sequence[Coroutine], payload: Any) -> No
             logger.critical("action failed: %s --> %s", action, e, exc_info=1)
 
 
-async def _get_response(ctx: ContextT, scroll: Scroll, peer_scroll: Scroll) -> dict:
-    """Attempts to register with a specific peer.
-
-    Parameters
-    ----------
-    ctx : ContextT
-        the current ZeroMQ context
-
-    scroll : Scroll
-        service description for local/calling service
-
-    peer_scroll : Scroll
-        service description for the peer
-
-    Returns
-    -------
-    dict
-        registration response from peer, if successful
-
-    Raises
-    ------
-    ValueError
-        if the provided scroll has no registration endpoint
-    MaxRetriesReached
-        raises after more than DEFAULT_RGSTR_MAX_ERRORS errors/timeouts
-    """
-
-    # prepare variables
-    response, registered, errors, last_log = None, False, 0, time() - 900
-    public_key, private_key = generate_curve_key_pair()
-    rgstr_endpoint = peer_scroll.endpoints.get("registration", None)
-
-    if not rgstr_endpoint:
-        raise ValueError(
-            f"no registration endpoint found for {peer_scroll.service_name}"
-        )
-
-    # good luck!
-    while not registered:
-        now = time()
-
-        # exponential backoff for exceptions, not used if collector is
-        # just unreachable because it could be back at any moment, and
-        # ... the show must go on!
-        time_out_after_error = TTL + 2**errors
-
-        # NOTE: We need to consider the possibility that our peer is
-        #       offline/unreachable. But we also don't want to wait
-        #       forever for a response. Therefore we will use a
-        #       timeout, but that means that the socket needs to be
-        #       a one-time socket that is recreated for every attempt.
-        #       Otherwise, requests would pile up in the local queue,
-        #       and collector would receive duplicate messages (also
-        #       with expired TTL).
-        #       I tried different socket options, but couldn't find a
-        #       better way to do this. But maybe there is one ...?!
-
-        # send the registration request
-        if log_it := now > last_log + DEFAULT_RGSTR_LOG_INTERVAL:
-            logger.info("... sending registration request ...")
-            logger.debug("...config: %s", peer_scroll)
-            last_log = now
-
-        with zmq.asyncio.Socket(ctx, zmq.DEALER) as sock:
-            try:
-                # configure socket & connection encryption
-                server_public_key = peer_scroll.public_key
-                logger.debug("will use server public key: %s" % server_public_key)
-
-                sock.setsockopt(zmq.LINGER, TTL)
-                sock.curve_secretkey = private_key.encode("ascii")
-                sock.curve_publickey = public_key.encode("ascii")
-                sock.curve_serverkey = server_public_key.encode("ascii")
-                sock.connect(rgstr_endpoint)
-
-                # send the request
-                await scroll.send(sock)
-
-                # activate the DEBUG flag at the top of the file to
-                # see what's going on with encrypted connections
-                if DEBUG:
-                    monitor = sock.get_monitor_socket()
-
-                    try:
-                        event = await asyncio.wait_for(monitor.recv_multipart(), 2)
-                        parsed = parse_monitor_message(event)
-                        logger.debug("monitor msg: %s", parsed)
-                    except asyncio.TimeoutError:
-                        pass
-                    except zmq.ZMQError as e:
-                        logger.error(
-                            "registration monitor -> zmq error: %s", e, exc_info=1
-                        )
-
-                # ... & wait for an answer, retry if necessary
-                response = await asyncio.wait_for(sock.recv_json(), TTL)
-
-            except ConnectionRefusedError as e:
-                logger.error("connection refused: %s", e, exc_info=1)
-
-            except asyncio.TimeoutError:
-                # don't log it every time
-                if log_it:
-                    logger.warning(
-                        "... %s unreachable, but I won't give up easily",
-                        peer_scroll.service_name,
-                    )
-                errors += 1
-
-            except zmq.ZMQError as e:
-                logger.error(f"ZMQ error: {e} for {scroll}")
-                logger.info("will try again in %s seconds...", time_out_after_error)
-                await asyncio.sleep(time_out_after_error)
-                errors += 1
-
-            except Exception as e:
-                logger.error(f"unexpected error: {e} for: {scroll}", ecx_info=1)
-                logger.info("will try again in %s seconds...", time_out_after_error)
-                await asyncio.sleep(time_out_after_error)
-                errors += 1
-
-            else:
-                logger.debug(
-                    "received reply from %s: %s", peer_scroll.service_name, response
-                )
-                registered = True
-
-            finally:
-                if not response and errors > DEFAULT_RGSTR_MAX_ERRORS:
-                    raise MaxRetriesReached(
-                        "unable to register with {}r {} after {} errors".format(
-                            peer_scroll.service_name,
-                            rgstr_endpoint,
-                            DEFAULT_RGSTR_MAX_ERRORS,
-                        )
-                    )
-
-    return response
-
-
 # --------------------------------------------------------------------------------------
 # main function for registering with a peer kinsman
 async def register(
@@ -508,7 +421,7 @@ async def register(
         the current ZMQ context
 
     config : ConfigT
-        this streamers configuration object
+        local component configuration
 
     rgstr_info_coro : Coroutine
         a coroutine that returns the registration information.
@@ -519,7 +432,7 @@ async def register(
     Returns
     -------
     Scroll
-        registration reply
+        A Scroll instance from the registration reply
 
     Raises
     ------
@@ -542,13 +455,13 @@ async def register(
         logger.info(
             "... registering with %s - at %s (public key: %s)",
             peer_scroll.service_name,
-            peer_scroll.endpoints.get("registration"),
+            peer_scroll.endpoint,
             peer_scroll.public_key,
         )
 
         try:
-            response = await _get_response(ctx, scroll, peer_scroll)
-            peer_scroll = await _process_registration_reply(response)
+            response = await one_time_request(ctx, scroll, peer_scroll)
+            peer_scroll = await process_rgstr_reply(await decode_rgstr_reply(response))
         except ValueError as e:  # missing registration endpoint for peer
             logger.error(e)
             await asyncio.sleep(10)
@@ -574,19 +487,101 @@ async def register(
     return peer_scroll
 
 
-async def send_reply(req: Scroll, config: ConfigT):
-    """Send a registration reply."""
-    reply = Scroll.from_dict(config.as_dict())
+async def send_reply_ok(scroll: Scroll, config: ConfigT) -> None:
+    """Sends a reply for an accepted registration request that we received.
 
-    await reply.send(socket=req._socket, routing_key=req._routing_key)
+    Parameters
+    ----------
+    scroll : Scroll
+        the peer scroll from the registration request
+    config: ConfigT
+        our configuration
+    error: Optional[str], optional
+        any error that might have occured while processing the request
+    """
+    logger.info("sending reply to %s", scroll.name)
+
+    reply = Scroll.from_dict(config.as_dict())
+    await reply.send(socket=scroll._socket, routing_key=scroll._routing_key)
+
+
+async def send_reply_fail(scroll: Scroll, error: Optional[str] = None) -> None:
+    """Sends a reply for a failed registration request that we received.
+
+    Parameters
+    ----------
+    scroll : Scroll
+        the peer scroll from the registration request
+    config: ConfigT
+        our configuration
+    error: Optional[str], optional
+        any error that might have occured while processing the request
+    """
+    logger.info("sending reply to %s", scroll.name)
+
+    try:
+        await scroll._socket.send_multipart(
+            [scroll._routing_key, json.dumps({"error": error}).encode("utf-8")]
+        )
+    except AttributeError as e:
+        logger.error(e)
+    except zmq.ZMQError as e:
+        logger.error(e)
+    except Exception as e:
+        logger.error("unexpected error: %s", e, exc_info=1)
 
 
 # --------------------------------------------------------------------------------------
+async def process_registration(
+    scroll: ScrollT, config: ConfigT, on_rcv: Coroutine, reply: bool = True
+) -> None:
+    """Process a new registration.
+
+    This method is used when a Kinsman registers with us, and when we
+    get a repsonse to our registration request -> reply: True/False.
+
+    Parameters
+    ----------
+    scroll : rgstr.Scroll
+        Scroll instance containing the peer information.
+    """
+    logger.info("processing registration for %s, %s", scroll.name, scroll.service_type)
+    logger.debug("will send reply: %s" % reply)
+    caller = inspect.stack()[0][1]
+    logger.debug("calling function: %s" % caller)
+
+    try:
+        await on_rcv(scroll)
+        error = None
+
+    except BadScrollError as e:
+        logger.error("bad scroll: %s -> %s", scroll, e)
+
+    except KeyError as e:
+        logger.error("no heartbeat endpoint in scroll: %s -> %s", scroll, e)
+        error = "bad heartbeat endpoint"
+
+    except zmq.ZMQError as e:
+        logger.error("ZMQ error while connecting to endpoint: %s", e)
+
+    except Exception as e:
+        logger.error("unexpected error: %s", e, exc_info=1)
+        error = f"unexpected error: {e}"
+
+    else:
+        if reply:
+            logger.debug("sending reply to %s", scroll.name)
+            await send_reply_ok(scroll=scroll, config=config)
+
+    finally:
+        if error:
+            await send_reply_fail(scroll=scroll, error=error)
+
+
 async def monitor_registration(
     socket: zmq.Socket,
     callbacks: Optional[Sequence[Coroutine]] = None,
     queues: Optional[Sequence[asyncio.queues.Queue]] = None,
-    verbose: bool = True,
 ) -> None:
     """Monitors the registration socket.
 
@@ -670,14 +665,6 @@ async def monitor_registration(
             # logger.error("exception caused by this msg: %s", msg_bytes)
 
     logger.info("registration monitor stopped: OK")
-
-
-@dataclass
-class ServiceInfoRequest:
-    service_type: str
-
-    async def send(self, socket):
-        socket.send_multipart([self.service_type.encode()])
 
 
 class Vigilante:
@@ -813,7 +800,7 @@ class Rawi:
         ctx: ContextT,
         config: ConfigT,
         rgstr_info_coro: Coroutine,
-        actions: Optional[Sequence[Coroutine[Scroll, None, None]]] = None,
+        on_rcv: Coroutine
     ) -> None:
         """Initialize the Rawi (registration) instance.
 
@@ -836,21 +823,9 @@ class Rawi:
         self.ctx = ctx
         self.config = config
         self.rgstr_info_coro = rgstr_info_coro
-        self.actions = actions
+        self.on_rcv = on_rcv
 
-        # configure the registration socket
-        logger.info("configuring registration socket at %s", config.rgstr_addr)
-        logger.debug("public key: %s", config.public_key)
-
-        self.rgstr_sock = ctx.socket(zmq.ROUTER)
-        if self.config.encrypt:
-            self.rgstr_sock.curve_secretkey = config.private_key.encode("ascii")
-            self.rgstr_sock.curve_publickey = config.public_key.encode("ascii")
-            self.rgstr_sock.curve_server = True
-        else:
-            logger.warn("registration socket is NOT ENCRYPTED")
-        self.rgstr_sock.bind(config.rgstr_addr)
-
+        self.rgstr_sock: SockT = None
         self.monitor_task = None
 
         logger.debug("Rawi instance created")
@@ -858,30 +833,43 @@ class Rawi:
     # ..................................................................................
     async def start(self):
         """Start the Rawi instance"""
+        self.rgstr_sock = await get_rgstr_sock(self.ctx, self.config)
+
         self.monitor_task = asyncio.create_task(
-            monitor_registration(self.rgstr_sock, self.actions)
+            monitor_registration(self.rgstr_sock, [self.on_rcv])
         )
+
+        # register with the Central Service Registry (Amanya)
+        if peer_scroll := await self.register_with_service_registry(self.config):
+            logger.debug("CSR peer scroll received ...")
+            await self.on_rcv(peer_scroll, reply=False)
+            logger.info("registered with CSR: OK")
 
     async def stop(self):
         """Stop the Rawi instance"""
         if self.monitor_task:
             self.monitor_task.cancel()
 
-        self.rgstr_sock.close()
+        self.rgstr_sock.close(0)
 
     # ..................................................................................
     async def register_with_service_registry(self, config: ConfigT) -> Scroll | None:
-        if config.service_registry is not None:
-            rgstr_info_coro = partial(
-                self.static_rgstr_info_coro, self.config.service_registry
-            )
+        if "csr" not in self.config.rgstr_with:
+            return None
 
-            return await self.register(rgstr_info_coro=rgstr_info_coro, actions=[])
-        else:
+        if config.service_registry is None:
             logger.error(
                 "unable to register with Central Service Registry , "
                 "missing service registry infomation"
             )
+            return None
+
+        logger.debug("Starting registration with CSR...")
+
+        return await self.register(
+            rgstr_info_coro=partial(self.rgstr_bootstrap, self.config.service_registry),
+            actions=[],
+        )
 
     # ..................................................................................
     async def register(
@@ -895,7 +883,7 @@ class Rawi:
             return await register(
                 ctx=self.ctx,
                 config=self.config,
-                rgstr_info_coro=rgstr_info_coro or self.static_rgstr_info_coro,
+                rgstr_info_coro=rgstr_info_coro or self.rgstr_bootstrap,
                 actions=actions,
             )
         except RegistrationError as e:
@@ -903,49 +891,7 @@ class Rawi:
         except Exception as e:
             logger.critical("unexpected error: %s", e, exc_info=1)
 
-    async def send_reply(
-        self,
-        scroll: Scroll,
-        config: ConfigT,
-        error: Optional[str] = None,
-    ):
-        """Sends a reply for a registration request that we received.
-
-        Parameters
-        ----------
-        scroll : Scroll
-            the peer scroll from the registration request
-
-        config: ConfigT
-            our configuration
-
-        error: Optional[str], optional
-            any error that might have occured while processing the request
-        """
-        logger.info("sending reply to %s", scroll.name)
-
-        if not error:
-            reply = Scroll.from_dict(config.as_dict())
-            await reply.send(socket=scroll._socket, routing_key=scroll._routing_key)
-
-        else:
-            # hopefully this works to inform the client about the error,
-            # but depending on the error, this might not be possible
-            try:
-                await self.rgstr_sock.send_multipart(
-                    [scroll._routing_key, json.dumps({"error": error}).encode("utf-8")]
-                )
-            except AttributeError as e:
-                logger.error(e)
-                return
-            except zmq.ZMQError as e:
-                logger.error(e)
-            except Exception as e:
-                logger.error("unexpected error: %s", e, exc_info=1)
-
-    async def static_rgstr_info_coro(
-        self, service_registry: dict[str, str]
-    ) -> NamedTuple:
+    async def rgstr_bootstrap(self, service_registry: dict[str, str]) -> NamedTuple:
         """Return static registration information for the Central Service Registry.
 
         Takes the information about the central service registry from
@@ -968,19 +914,16 @@ class Rawi:
             raise RegistrationError("service_registry in config, missing: 'endpoint'")
 
         class StaticRegistrationInfo(NamedTuple):
+            name: str
             service_name: str
             endpoint: str
             public_key: str
-            endpoints: dict
 
         rgstr_endpoint = service_registry.get("endpoint", None)
 
         return StaticRegistrationInfo(
+            name="Amanya",
             service_name="Central Service Registry",
             endpoint=rgstr_endpoint,
             public_key=service_registry.get("public_key", None),
-            endpoints={
-                "registration": rgstr_endpoint,
-                "publisher": service_registry.endpoints.get("publisher", None),
-            },
         )

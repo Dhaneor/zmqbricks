@@ -43,7 +43,6 @@ from typing import (
     Mapping,
     TypeAlias,
     Any,
-    NamedTuple,
     TypeVar,
 )
 
@@ -571,8 +570,6 @@ async def monitor_registration(
 
     nonces = deque(maxlen=MAX_LEN_NONCE_CACHE)
 
-    # monitor = socket.get_monitor_socket()
-
     while True:
         try:
             msg_bytes = await socket.recv_multipart()
@@ -631,70 +628,101 @@ async def monitor_registration(
 
 
 class Vigilante:
-    """Class that monitors the Central Service Registry (Amanya)."""
+    """Class that manages registrations for peer kinsman.
+
+    rawi --> Arabic for registry
+
+    Parameters
+    ----------
+    ctx : ContextT
+        Currently active (async) ZeroMQ context
+
+    config : ConfigT
+        The component configuration object
+
+    rgstr_info_coro : Coroutine[None, Scroll]
+        A coroutine that returns registration information. It
+        should return a Scroll instance from the peer that this
+        component should register with.
+
+    actions : Optional[Sequence[Coroutine[Scroll, None, None]]], optional
+        Actions to perform after a peer registered with this component.
+    """
 
     def __init__(
         self,
-        context: ContextT,
+        ctx: ContextT,
         config: ConfigT,
-        csr: ScrollT,
-        on_new: Sequence[Coroutine],
+        bootstrap: Coroutine,
+        on_rcv: Coroutine
     ) -> None:
-        self.ctx = context
+        """Initialize the Rawi (registration) instance.
+
+        Parameters
+        ----------
+        ctx : ContextT
+            Currently active (async) ZeroMQ context
+
+        config : ConfigT
+            The component configuration object
+
+        bootstrap : Callable[None, Scroll]
+            A function that returns registration information. It
+            should return a Scroll instance from the peer that this
+            component should register with.
+
+        on_rcv : Coroutine
+            Action to perform after a peer registered with this component.
+        """
+        self.ctx = ctx
         self.config = config
-        self.csr = csr
-        self.on_new = on_new or []
+        self.bootstrap = bootstrap
+        self.on_rcv = on_rcv
 
-        self.services = []  # local services registry
+        self.sock: SockT = None
+        self.tasks: list = []
+
+        self.services = []  # local registry of theoretically available services
         self.pending = asyncio.Queue()
-
-        self.tasks = []
         self.initialized = False  # set to True when we have initial data
 
-    async def start(self) -> None:
-        self.tasks = [
-            asyncio.create_task(self.monitor_updates()),
-            asyncio.create_task(self.get_initial_data()),
-            asyncio.create_task(self.process_update()),
-        ]
-        logger.info("CSR agent started: OK")
+        logger.debug("Vigilante instance created")
 
-    async def stop(self) -> None:
+    # ..................................................................................
+    async def start(self):
+        """Start the Vigilante instance"""
+        self.sock = await get_rgstr_sock(self.ctx, self.config)
+
+        # register with the Central Service Registry (Amanya)
+        if peer_scroll := await self.register_with_service_registry():
+            logger.debug("CSR peer scroll received ...")
+
+            self.csr = peer_scroll
+
+            self.tasks = [
+                asyncio.create_task(monitor_registration(self.sock, [self.on_rcv])),
+                asyncio.create_task(self.get_initial_data()),
+                asyncio.create_task(self.monitor_updates(peer_scroll)),
+                asyncio.create_task(self.process_update()),
+            ]
+
+            await self.on_rcv(peer_scroll, reply=False)
+            logger.info("registered with CSR: OK")
+
+    async def stop(self):
+        """Stop the Vigilante instance"""
         for task in self.tasks:
             task.cancel()
 
         await asyncio.gather(*self.tasks)
 
-        csr_monitor.close(0)
-        logger.info("CSR agent stopped: OK")
+        if self.sock is not None:
+            self.sock.close(0)
 
-    async def monitor_updates(self) -> None:
-        # configure subscriber socket
-        public_key, private_key = generate_curve_key_pair()
-        csr_monitor = self.ctx.socket(zmq.SUB)
-        csr_monitor.curve_secretkey = private_key.encode("ascii")
-        csr_monitor.curve_publickey = public_key.encode("ascii")
-        csr_monitor.curve_serverkey = self.csr.public_key.encode("ascii")
-        csr_monitor.connect(self.csr.endpoints.get("publisher"))
-        csr_monitor.setsockopt(zmq.SUBSCRIBE, b"")
-
-        logger.info("monitor CSR updates started: OK")
-
-        while True:
-            try:
-                self.pending.put_nowait(await csr_monitor.recv_multipart())
-            except asyncio.CancelledError:
-                break
-            except zmq.ZMQError as e:
-                logger.error("csr_agent -> zmq error: %s", e, exc_info=1)
-            except ValueError as e:
-                logger.error(e)
-            except Exception as e:
-                logger.exception("unexpected error: %s", e, exc_info=1)
-
-        logger.info("monitor CSR updates stopped: OK")
-
+    # ..................................................................................
     async def get_initial_data(self):
+        logger.debug("requesting initial data from CSR ...")
+
         for service_type in self.config.rgstr_with:
             if service_type == "csr":
                 continue
@@ -726,6 +754,33 @@ class Vigilante:
         self.initialized = True
         logger.debug("CSR agent initialized: OK")
 
+    async def monitor_updates(self, csr_scroll: ScrollT) -> None:
+        # configure subscriber socket
+        public_key, private_key = generate_curve_key_pair()
+        csr_monitor = self.ctx.socket(zmq.SUB)
+        csr_monitor.curve_secretkey = private_key.encode("ascii")
+        csr_monitor.curve_publickey = public_key.encode("ascii")
+        csr_monitor.curve_serverkey = csr_scroll.public_key.encode("ascii")
+        csr_monitor.connect(csr_scroll.endpoints.get("publisher"))
+        csr_monitor.setsockopt(zmq.SUBSCRIBE, b"")
+
+        logger.info("monitor CSR updates started: OK")
+
+        while True:
+            try:
+                self.pending.put_nowait(await csr_monitor.recv_multipart())
+            except asyncio.CancelledError:
+                break
+            except zmq.ZMQError as e:
+                logger.error("csr_agent -> zmq error: %s", e, exc_info=1)
+            except ValueError as e:
+                logger.error(e)
+            except Exception as e:
+                logger.exception("unexpected error: %s", e, exc_info=1)
+
+        csr_monitor.close(0)
+        logger.info("monitor CSR updates stopped: OK")
+
     async def process_update(self):
         while not self.initialized:
             await asyncio.sleep(0.1)
@@ -744,10 +799,7 @@ class Vigilante:
                     continue
 
                 for elem in data:
-                    decoded = json.loads(elem.decode())
-
-                    # scroll = Scroll.from_msg(data)
-                    scroll = Scroll.from_dict(decoded)
+                    scroll = Scroll.from_dict(json.loads(elem.decode()))
 
                     if command == "ADD":
                         await self.add_service(scroll)
@@ -773,111 +825,19 @@ class Vigilante:
         if scroll not in self.services:
             self.services.append(scroll)
 
-        if self.on_new:
-            [await callback(scroll) for callback in self.on_new]
+        async def coro():
+            return scroll
+
+        await register(self.ctx, self.config, coro, [self.on_rcv])
 
     async def remove_service(self, scroll: Scroll) -> None:
         self.services.remove(scroll)
 
-
-class Rawi:
-    """Class that manages registrations for peer kinsman.
-
-    rawi --> Arabic for registry
-
-    Parameters
-    ----------
-    ctx : ContextT
-        Currently active (async) ZeroMQ context
-
-    config : ConfigT
-        The component configuration object
-
-    rgstr_info_coro : Coroutine[None, Scroll]
-        A coroutine that returns registration information. It
-        should return a Scroll instance from the peer that this
-        component should register with.
-
-    actions : Optional[Sequence[Coroutine[Scroll, None, None]]], optional
-        Actions to perform after a peer registered with this component.
-    """
-
-    def __init__(
-        self,
-        ctx: ContextT,
-        config: ConfigT,
-        rgstr_info_coro: Coroutine,
-        on_rcv: Coroutine
-    ) -> None:
-        """Initialize the Rawi (registration) instance.
-
-        Parameters
-        ----------
-        ctx : ContextT
-            Currently active (async) ZeroMQ context
-
-        config : ConfigT
-            The component configuration object
-
-        rgstr_info_coro : Callable[None, Scroll]
-            A function that returns registration information. It
-            should return a Scroll instance from the peer that this
-            component should register with.
-
-        actions : Optional[Sequence[Coroutine[Scroll, None, None]]], optional
-            Actions to perform after a peer registered with this component.
-
-        on_rcv : Coroutine
-
-        """
-        self.ctx = ctx
-        self.config = config
-        self.rgstr_info_coro = rgstr_info_coro
-        self.on_rcv = on_rcv
-
-        self.rgstr_sock: SockT = None
-        self.tasks: list = []
-        self.vigilante: Vigilante | None = None
-
-        logger.debug("Rawi instance created")
-
-    # ..................................................................................
-    async def start(self):
-        """Start the Rawi instance"""
-        self.rgstr_sock = await get_rgstr_sock(self.ctx, self.config)
-
-        self.tasks.append(
-            asyncio.create_task(monitor_registration(self.rgstr_sock, [self.on_rcv]))
-        )
-
-        # register with the Central Service Registry (Amanya)
-        if peer_scroll := await self.register_with_service_registry(self.config):
-            logger.debug("CSR peer scroll received ...")
-            await self.on_rcv(peer_scroll, reply=False)
-            logger.info("registered with CSR: OK")
-
-            self.vigilante = Vigilante(self.ctx, self.config, peer_scroll, [])
-            await self.vigilante.start()
-
-    async def stop(self):
-        """Stop the Rawi instance"""
-        if self.vigilante is not None:
-            await self.vigilante.stop()
-
-        for task in self.tasks:
-            task.cancel()
-
-        await asyncio.gather(*self.tasks)
-
-        if self.rgstr_sock is not None:
-            self.rgstr_sock.close(0)
-
-    # ..................................................................................
-    async def register_with_service_registry(self, config: ConfigT) -> Scroll | None:
+    async def register_with_service_registry(self) -> Scroll | None:
         if not self.config.rgstr_with or "csr" not in self.config.rgstr_with:
             return None
 
-        if config.service_registry is None:
+        if self.config.service_registry is None:
             logger.error(
                 "unable to register with Central Service Registry , "
                 "missing service registry infomation"
@@ -888,56 +848,8 @@ class Rawi:
 
         return await register(
             ctx=self.ctx,
-            config=config,
-            rgstr_info_coro=self.rgstr_bootstrap,
+            config=self.config,
+            rgstr_info_coro=self.bootstrap,
             actions=[],
             try_forever=True
-        )
-
-    # ..................................................................................
-    async def register(
-        self,
-        rgstr_info_coro: Optional[Coroutine] = None,
-        actions: Optional[Sequence[Coroutine]] = None,
-    ) -> Scroll:
-        try:
-            return await register(
-                ctx=self.ctx,
-                config=self.config,
-                rgstr_info_coro=rgstr_info_coro or self.rgstr_bootstrap,
-                actions=actions
-            )
-        except RegistrationError as e:
-            logger.critical(e)
-        except Exception as e:
-            logger.critical("unexpected error: %s", e, exc_info=1)
-
-    async def rgstr_bootstrap(self) -> NamedTuple:
-        """Return static registration information for the Central Service Registry.
-
-        Takes the information about the central service registry from
-        the provided configuration file and returns a NamedTuple that
-        replaces the Scroll class that would normally be used for
-        registrations.
-
-        Parameters
-        ----------
-        servive_registry: dict
-            The central service registry information, must contain:
-            - endpoint: the endpoint of the central service registry
-            - public_key: the public key of the central service registry
-        """
-        class StaticRegistrationInfo(NamedTuple):
-            name: str
-            service_name: str
-            endpoints: dict
-            public_key: str
-
-        rgstr_endpoint = self.config.service_registry.get("endpoint", None)
-
-        return StaticRegistrationInfo(
-            name="Amanya",
-            service_name="Central Service Registry",
-            endpoints={"registration": rgstr_endpoint},
-            public_key=self.config.service_registry.get("public_key", None),
         )

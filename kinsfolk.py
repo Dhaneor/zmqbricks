@@ -23,13 +23,15 @@ import logging
 import time
 
 from dataclasses import dataclass
-from typing import Optional, Mapping, Sequence, Coroutine, TypeVar
+from typing import Optional, Mapping, Sequence, Coroutine, Any, TypeVar
 
-from .registration import Scroll
+from .registration import Scroll, ScrollT
 from .exceptions import BadScrollError
 
 logger = logging.getLogger("main.kinsfolk")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
+
+CallbacksT = TypeVar("CallbacksT", bound=Sequence[Coroutine[Any, Any, None]])
 
 GRACE_PERIOD = 86400  # delete inactive kinsman after x seconds
 
@@ -59,7 +61,10 @@ class Kinsman:
     def __repr__(self) -> str:
         serv_name = self.service_name.upper() if self.service_name else "UNKNOWN"
 
-        return f"Kinsman {self.name}, Keeper of the {serv_name} " f"({self.liveness})"
+        return (
+            f"Kinsman {self.name}, Keeper of the {serv_name} "
+            f"for {self.exchange} ({self.liveness})"
+        )
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -180,7 +185,7 @@ class Kinsfolk:
         }
 
     # .................................................................................
-    async def watch_out(self, actions: Optional[Sequence[Coroutine]] = None) -> None:
+    async def watch_out(self, actions: CallbacksT = None) -> None:
         """Watch over the health of the Kinsfolk.
 
         NOTE: This is a blocking call and should be run as a task!
@@ -198,7 +203,7 @@ class Kinsfolk:
         actions: Sequence[Coroutine], optional
             actions to be executed in case we have no more kinsman left
         """
-        logger.debug("watching out ...")
+        logger.info("watching out ...")
 
         while True:
             try:
@@ -230,6 +235,7 @@ class Kinsfolk:
     async def add(self, kinsman: Kinsman) -> None:
         """Adds a new Kinsman to the Kinsfolk"""
         self._kinsfolk[kinsman.identity] = kinsman
+        logger.info("Welcome to Kinsman %s" % kinsman)
 
     async def update(
         self, identity: str, payload: dict = None, on_missing: Coroutine = None
@@ -266,15 +272,15 @@ class Kinsfolk:
             if on_missing:
                 await on_missing(identity)
 
-    async def accept(
-        self, scroll: Scroll, on_success: Optional[Coroutine] = None
-    ) -> bool:
+    async def accept(self, scroll: ScrollT, on_success: CallbacksT = None) -> bool:
         """Accepts a new Kinsman to the Kinsfolk
 
         Parameters
         ----------
         scroll : Scroll
             A registration request to accept a new Kinsman to the Kinsfolk.
+        on_success : Sequence[Coroutine], optional
+            Actions to perform in case the Kinsman was accepted, by default None
 
         Returns
         -------
@@ -286,30 +292,23 @@ class Kinsfolk:
         BadScrollError
             if the scroll is not valid / could not be processed
         """
-        if scroll.uid in self._kinsfolk:
-            logger.warning(
-                "Kinsman %s already in Kinsfolk -> %s",
-                scroll.name,
-                ", ".join([k.name for k in self._kinsfolk.values()]),
-            )
-            return True
-
         try:
             kinsman = Kinsman.from_scroll(scroll, self.hb_liveness)
-            self._kinsfolk[kinsman.identity] = kinsman
-            logger.info(
-                "Welcome to Kinsman %s, Keeper of the %s for %s (%s)",
-                kinsman.name,
-                kinsman.service_type.upper(),
-                kinsman.exchange.upper(),
-                ", ".join(kinsman.markets),
-            )
         except Exception as e:
             logger.error(f"unexpected error creating a Kinsman: {e}")
             raise BadScrollError() from e
         else:
-            await on_success(scroll)
-            return True
+            if kinsman.identity not in self.active_kinsmen:
+                await self.add(kinsman)
+                if not on_success:
+                    logger.warning("===> NO CALLBACK ACTIONS configured! <===")
+                for coro in on_success or []:
+                    logger.debug("calling callback: %s", coro)
+                    await coro(scroll)
+            else:
+                logger.warning("Kinsman %s already in Kinsfolk" % kinsman)
+
+        return True
 
     def check_health(self) -> None:
         """Checks the health of the Kinsfolk"""
@@ -330,9 +329,7 @@ class Kinsfolk:
         # don't consider him to be dead when his status is "inactive",
         # but do so, if the time he hasn't been seen exceeds the grace period
         if not kinsman.is_active:
-            return (
-                True if time.time() - kinsman.last_seen < self.grace_period else False
-            )
+            return True if now - kinsman.last_seen < self.grace_period else False
 
         # well, he/she is alive, but did not send a heartbeat fast enough
         kinsman.liveness -= 1
@@ -352,7 +349,8 @@ class Kinsfolk:
         kinsman.status = "inactive"
 
         if self.on_inactive_kinsman:
-            asyncio.create_task(self.on_inactive_kinsman(kinsman=kinsman))
+            for coro in self.on_inactive_kinsman or []:
+                asyncio.create_task(coro(kinsman.to_scroll()))
 
         return False
 

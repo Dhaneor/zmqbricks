@@ -89,6 +89,7 @@ async def one_time_request(
 
         with zmq.asyncio.Socket(ctx, zmq.DEALER) as sock:
             try:
+                logger.debug("... connecting to %s", srv_endpoint)
                 logger.debug("... will use server public key: %s" % srv_pubkey)
                 public_key, private_key = generate_curve_key_pair()
 

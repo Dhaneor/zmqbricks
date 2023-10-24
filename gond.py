@@ -45,8 +45,8 @@ ConfigT = TypeVar("ConfigT", bound=cnf.BaseConfig)
 ContextT = TypeVar("ContextT", bound=zmq.asyncio.Context)
 
 
-async def exc_handler(event):
-    logger.critical("Unhandled exception: %s", event, exc_info=1)
+def exc_handler(event, mystery):
+    logger.critical("Unhandled exception: %s - %s", event, mystery, exc_info=1)
 
 
 # ======================================================================================
@@ -62,12 +62,22 @@ class Gond:
 
         self.kinsfolk = kf.Kinsfolk(config.hb_interval, config.hb_liveness)
         self.heart = hb.Hjarta(ctx, config, on_rcv=[self.kinsfolk.update])
-        self.kinsfolk.on_inactive_kinsman = self.heart.remove_hb_sender
+
+        # prepare actions to perform after successful registration
+        send_rgstr_reply = partial(rgstr.send_reply_ok, config=self.config)
+        on_rgstr_success = [send_rgstr_reply, self.heart.add_hb_sender]
+        on_rgstr_success.extend(list(kwargs.get("on_rgstr_success", [])))
 
         self.vigilante = rgstr.Vigilante(
-            ctx=ctx, config=config, bootstrap=self.rgstr_bootstrap,
-            on_rcv=partial(self.kinsfolk.accept, on_success=self.heart.add_hb_sender)
+            ctx=ctx,
+            config=config,
+            bootstrap=self.rgstr_bootstrap,
+            on_rcv=partial(self.kinsfolk.accept, on_success=on_rgstr_success),
         )
+
+        self.kinsfolk.on_inactive_kinsman = [
+            self.heart.remove_hb_sender, self.vigilante.remove_service
+        ]
 
     def __repr__(self) -> str:
         return f"Gond(config={vars(self.config)})"
@@ -82,7 +92,7 @@ class Gond:
         self.tasks = [
             create_task(self.heart.start(), name="heartbeats"),
             create_task(self.vigilante.start(), name="registration"),
-            create_task(self.kinsfolk.watch_out(), name="kinsfolk")
+            create_task(self.kinsfolk.watch_out(), name="kinsfolk"),
         ]
 
         return self
@@ -114,6 +124,7 @@ class Gond:
             - endpoint: the endpoint of the central service registry
             - public_key: the public key of the central service registry
         """
+
         class StaticRegistrationInfo(NamedTuple):
             name: str
             service_name: str

@@ -24,8 +24,8 @@ try:
     from .util.sockets import SockDef
 except ImportError:
     import config as cnf
-    from fukujou.curve import generate_curve_key_pair
-    from util.sockets import SockDef
+    from .fukujou.curve import generate_curve_key_pair
+    from .util.sockets import SockDef
 
 
 class BaseConfig:
@@ -44,6 +44,8 @@ class BaseConfig:
     rgstr_timeout: int = cnf.RGSTR_TIMEOUT  # registration timeout (seconds)
     rgstr_max_errors: int = cnf.RGSTR_MAX_ERRORS  # max no of registration errors
     rgstr_log_interval: int = cnf.RGSTR_LOG_INTERVAL  # resend request after (secs)
+
+    dev_env: bool = cnf.DEV_ENV  # development environment or not
 
     def __init__(
         self,

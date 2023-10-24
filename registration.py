@@ -64,7 +64,7 @@ from zmqbricks.exceptions import (
 logger = logging.getLogger("main.registration")
 logger.setLevel(logging.DEBUG)
 
-DEFAULT_RGSTR_TIMEOUT = 10  # seconds
+DEFAULT_RGSTR_TIMEOUT = 20  # seconds
 DEFAULT_RGSTR_LOG_INTERVAL = 900  # log the same message again after (secs)
 DEFAULT_RGSTR_MAX_ERRORS = 10  # maximum number of registration errors
 
@@ -72,7 +72,6 @@ ENCODING = "utf-8"
 TTL = 10  # time-to-live for a scroll (seconds)
 MAX_LEN_NONCE_CACHE = 1000  # how many nonces to store for comparison
 MAX_LEN_CSR_CACHE = 1000  # how many pending updates to store (CSR Agent)
-DEBUG = False  # set this to True for debuggging encrypted registration attempts
 
 KinsfolkT = TypeVar("KinsfolkT", bound=dataclass)
 SockT: TypeAlias = zmq.Socket
@@ -115,6 +114,9 @@ class Scroll:
     _socket: Optional[zmq.Socket] = None  # socket for use by the send method
     _routing_key: Optional[bytes] = None  # only for replies (for ROUTER socket)!
 
+    def __repr__(self):
+        return f"{self.service_name!r}"
+
     def __eq__(self, other) -> bool:
         return all(
             arg
@@ -134,7 +136,7 @@ class Scroll:
     def expired(self) -> bool:
         return time() > self.ttl
 
-    def prepare_send_msg(self) -> bytes:
+    def as_dict(self) -> bytes:
         return {
             var: getattr(self, var) for var in vars(self) if not var.startswith("_")
         }
@@ -151,7 +153,7 @@ class Scroll:
         routing_key = routing_key or self._routing_key
 
         # create msg as json encoded bytes string
-        as_dict = self.prepare_send_msg()
+        as_dict = self.as_dict()
         as_dict["nonce"] = Nonce.get_nonce()
         as_dict["ttl"] = time() + TTL
 
@@ -408,7 +410,7 @@ async def _call_them_callbacks(actions: Sequence[Coroutine], payload: Any) -> No
     """
     for action in actions:
         try:
-            logger.info("calling %s", action)
+            # logger.debug("calling %s", action)
             await action(payload)
         except Exception as e:
             logger.critical("action failed: %s --> %s", action, e, exc_info=1)
@@ -512,9 +514,16 @@ async def send_reply_ok(scroll: Scroll, config: ConfigT) -> None:
         the peer scroll from the registration request
     config: ConfigT
         our configuration
-    error: Optional[str], optional
-        any error that might have occured while processing the request
     """
+    # if the scroll has no socket, that means that we send the request
+    # and this is an answer --> we don't need to send a reply in this case.
+    # This is because we only give one set of actions to Vigilante (on_rcv),
+    # and maybe this should be split into two, one for registrations that
+    # we received, and one for those that we sent. After debugging this
+    # callback monster for days ... not now!
+    if not scroll._socket:
+        return
+
     logger.info("sending reply to %s", scroll.name)
 
     reply = Scroll.from_dict(config.as_dict())
@@ -686,12 +695,15 @@ class Vigilante:
         self.pending = asyncio.Queue()
         self.initialized = False  # set to True when we have initial data
 
-        logger.debug("Vigilante instance created")
+        logger.debug("Vigilante initialized: OK")
 
     # ..................................................................................
     async def start(self):
         """Start the Vigilante instance"""
         self.sock = await get_rgstr_sock(self.ctx, self.config)
+        self.tasks.append(
+            asyncio.create_task(monitor_registration(self.sock, [self.on_rcv]))
+        )
 
         # register with the Central Service Registry (Amanya)
         if peer_scroll := await self.register_with_service_registry():
@@ -699,14 +711,15 @@ class Vigilante:
 
             self.csr = peer_scroll
 
-            self.tasks = [
-                asyncio.create_task(monitor_registration(self.sock, [self.on_rcv])),
-                asyncio.create_task(self.get_initial_data()),
-                asyncio.create_task(self.monitor_updates(peer_scroll)),
-                asyncio.create_task(self.process_update()),
-            ]
+            self.tasks.extend(
+                [
+                    asyncio.create_task(self.get_initial_data()),
+                    asyncio.create_task(self.monitor_updates(peer_scroll)),
+                    asyncio.create_task(self.process_update()),
+                ]
+            )
 
-            await self.on_rcv(peer_scroll, reply=False)
+            await self.on_rcv(peer_scroll)
             logger.info("registered with CSR: OK")
 
     async def stop(self):
@@ -721,8 +734,6 @@ class Vigilante:
 
     # ..................................................................................
     async def get_initial_data(self):
-        logger.debug("requesting initial data from CSR ...")
-
         for service_type in self.config.rgstr_with:
             if service_type == "csr":
                 continue
@@ -762,7 +773,9 @@ class Vigilante:
         csr_monitor.curve_publickey = public_key.encode("ascii")
         csr_monitor.curve_serverkey = csr_scroll.public_key.encode("ascii")
         csr_monitor.connect(csr_scroll.endpoints.get("publisher"))
-        csr_monitor.setsockopt(zmq.SUBSCRIBE, b"")
+
+        for service_type in self.config.rgstr_with:
+            csr_monitor.setsockopt(zmq.SUBSCRIBE, service_type.encode())
 
         logger.info("monitor CSR updates started: OK")
 
@@ -790,9 +803,18 @@ class Vigilante:
         while True:
             try:
                 msg_bytes = await self.pending.get()
-                command, data = msg_bytes[0].decode(), msg_bytes[1:]
 
-                logger.debug("received msg: %s \n %s", command, data)
+                logger.debug("===> received msg: %s" % msg_bytes)
+                logger.debug("=" * 120)
+
+                logger.debug("received msg:\n %s", msg_bytes)
+
+                service_type = msg_bytes[0].decode()
+                command, data = msg_bytes[1].decode(), msg_bytes[2:]
+
+                if service_type not in self.config.rgstr_with:
+                    logger.warning("unexpected service type: %s" % service_type)
+                    continue
 
                 if not data or data[0] == b"":
                     logger.critical("got empty service info from CSR")
@@ -816,6 +838,8 @@ class Vigilante:
                 logger.error("unable to build scroll from dict: %s", e, exc_info=1)
             except BadScrollError as e:
                 logger.error(e)
+            except json.decoder.JSONDecodeError as e:
+                logger.error("unable to decode json: %s", e, exc_info=1)
             except Exception as e:
                 logger.exception("unexpected error: %s", e, exc_info=1)
 
@@ -823,6 +847,7 @@ class Vigilante:
 
     async def add_service(self, scroll: Scroll) -> None:
         if scroll not in self.services:
+            logger.debug("adding service: %s", scroll)
             self.services.append(scroll)
 
         async def coro():
@@ -831,14 +856,18 @@ class Vigilante:
         await register(self.ctx, self.config, coro, [self.on_rcv])
 
     async def remove_service(self, scroll: Scroll) -> None:
-        self.services.remove(scroll)
+        logger.info("removing service: %s", scroll)
+        self.services = list(filter(lambda s: s.uid != scroll.uid, self.services))
+        if scroll.service_type == "Central Configuration Service":
+            await self.register_with_service_registry()
 
     async def register_with_service_registry(self) -> Scroll | None:
         if not self.config.rgstr_with or "csr" not in self.config.rgstr_with:
+            logger.warning("registering with service registry not configured")
             return None
 
         if self.config.service_registry is None:
-            logger.error(
+            logger.critical(
                 "unable to register with Central Service Registry , "
                 "missing service registry infomation"
             )
@@ -846,10 +875,13 @@ class Vigilante:
 
         logger.debug("Starting registration with CSR...")
 
-        return await register(
+        scroll = await register(
             ctx=self.ctx,
             config=self.config,
             rgstr_info_coro=self.bootstrap,
             actions=[],
             try_forever=True
         )
+
+        await self.on_rcv(scroll)
+        return scroll

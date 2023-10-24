@@ -12,7 +12,7 @@ import zmq
 import zmq.asyncio
 
 from dataclasses import dataclass
-from typing import Sequence, Any, Literal, Optional
+from typing import Sequence, Any, Literal, Optional, TypeVar
 
 logger = logging.getLogger("main.socket")
 
@@ -30,7 +30,14 @@ SocketType = Literal[
     "STREAM",
 ]
 
+SockT = TypeVar("SockT", bound=zmq.Socket)
+ConfigT = TypeVar("ConfigT", bound=object)
+
 port_range_for_random_port = range(5600, 5700)
+
+
+def ip():
+    return "127.0.0.1"
 
 
 def socket_type(socket: zmq.Socket) -> str:
@@ -52,6 +59,26 @@ def socket_type(socket: zmq.Socket) -> str:
     }.get(socket_type, "UNKNOWN")
 
     return socket_type_str
+
+
+async def get_random_server_socket(name: str, type: SocketType, config: ConfigT) -> SockT:
+    context = zmq.Context.instance()
+    socket = context.socket(type)
+
+    if config.encrypt:
+        socket.curve_publickey = config.public_key.encode("ascii")
+        socket.curve_secretkey = config.private_key.encode("ascii")
+        socket.curve_server = True
+
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.bind("tcp://*:0")  # bind to random port
+
+    port = socket.getsockopt(zmq.LAST_ENDPOINT).decode().split(":")[-1]
+    config.endpoints[name] = (
+        f"tcp://127.0.0.1:{port}" if config.dev_env else f"tcp://{ip()}:{port}"
+    )
+
+    return socket
 
 
 # --------------------------------------------------------------------------------------

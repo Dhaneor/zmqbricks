@@ -14,8 +14,8 @@ DEV_ENV = True
 
 # some default values that are (can) be shared between components
 ENCODING = "utf-8"
-HB_INTERVAL = 1  # seconds
-HB_LIVENESS = 10  # heartbeat liveness
+HB_INTERVAL = 3  # seconds
+HB_LIVENESS = 3  # heartbeat liveness
 RGSTR_TIMEOUT = 10  # seconds
 RGSTR_LOG_INTERVAL = 900  # resend request after (secs)
 RGSTR_MAX_ERRORS = 10  # maximum number of registration errors

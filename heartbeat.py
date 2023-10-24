@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Optional, Sequence, Callable, Mapping, Any, TypeVar, Coroutine
 
-from zmqbricks.kinsfolk import Kinsman, KinsmanT  # noqa: F401, E402
+from zmqbricks.kinsfolk import KinsmanT  # noqa: F401, E402
 from zmqbricks.base_config import ConfigT  # noqa: F401, E402
 from zmqbricks.util.async_timer_with_reset import create_timer  # noqa: F401, E402
 

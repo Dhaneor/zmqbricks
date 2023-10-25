@@ -20,6 +20,7 @@ ContextT: TypeAlias = zmq.asyncio.Context
 ScrollT = TypeVar("ScrollT", bound=object)
 
 logger = logging.getLogger("main.one_time_request")
+logger.setLevel(logging.INFO)
 
 
 LOG_INTERVAL = 900  # log the same message again after (secs)

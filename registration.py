@@ -10,8 +10,9 @@ Classes:
     Scroll
         A standardized registration request message.
 
-    RegistrationReply
-        A standardized registration reply message
+    ServiceInfoRequest
+        A standardized message to request service information
+        from the Central Service Registry (CSR).
 
     Rawi
         registration component as class
@@ -115,7 +116,7 @@ class Scroll:
     _routing_key: Optional[bytes] = None  # only for replies (for ROUTER socket)!
 
     def __repr__(self):
-        return f"{self.service_name!r}"
+        return f"{self.name!r} - {self.service_name!r}"
 
     def __eq__(self, other) -> bool:
         return all(
@@ -410,7 +411,6 @@ async def _call_them_callbacks(actions: Sequence[Coroutine], payload: Any) -> No
     """
     for action in actions:
         try:
-            # logger.debug("calling %s", action)
             await action(payload)
         except Exception as e:
             logger.critical("action failed: %s --> %s", action, e, exc_info=1)
@@ -423,7 +423,7 @@ async def register(
     config: ConfigT,
     rgstr_info_coro: Coroutine,
     actions: Optional[Sequence[Coroutine]] = None,
-    try_forever: Optional[bool] = False
+    try_forever: Optional[bool] = False,
 ) -> Scroll:
     """Register with a peer kinsman.
 
@@ -494,7 +494,8 @@ async def register(
             logger.info("=" * 120)
             logger.info(
                 "registered with %s at %s",
-                peer_scroll.service_name, peer_scroll.endpoints.get("registration"),
+                peer_scroll.service_name,
+                peer_scroll.endpoints.get("registration"),
             )
             break
         finally:
@@ -659,11 +660,7 @@ class Vigilante:
     """
 
     def __init__(
-        self,
-        ctx: ContextT,
-        config: ConfigT,
-        bootstrap: Coroutine,
-        on_rcv: Coroutine
+        self, ctx: ContextT, config: ConfigT, bootstrap: Coroutine, on_rcv: Coroutine
     ) -> None:
         """Initialize the Rawi (registration) instance.
 
@@ -707,7 +704,7 @@ class Vigilante:
 
         # register with the Central Service Registry (Amanya)
         if peer_scroll := await self.register_with_service_registry():
-            logger.debug("CSR peer scroll received ...")
+            logger.debug(">>>>> starting tasks now ...")
 
             self.csr = peer_scroll
 
@@ -718,9 +715,6 @@ class Vigilante:
                     asyncio.create_task(self.process_update()),
                 ]
             )
-
-            await self.on_rcv(peer_scroll)
-            logger.info("registered with CSR: OK")
 
     async def stop(self):
         """Stop the Vigilante instance"""
@@ -734,6 +728,7 @@ class Vigilante:
 
     # ..................................................................................
     async def get_initial_data(self):
+        logger.debug(">>>> GETTING INITIAL DATA")
         for service_type in self.config.rgstr_with:
             if service_type == "csr":
                 continue
@@ -747,7 +742,7 @@ class Vigilante:
                             ctx=self.ctx,
                             client=ServiceInfoRequest(service_type),
                             server=self.csr,
-                            endpoint="requests"
+                            endpoint="requests",
                         )
                     )
                 except BadScrollError as e:
@@ -795,6 +790,9 @@ class Vigilante:
         logger.info("monitor CSR updates stopped: OK")
 
     async def process_update(self):
+        """Process an update about available services"""
+
+        # wait for all tasks started by this class to initialize
         while not self.initialized:
             await asyncio.sleep(0.1)
 
@@ -813,10 +811,15 @@ class Vigilante:
                 command, data = msg_bytes[1].decode(), msg_bytes[2:]
 
                 if service_type not in self.config.rgstr_with:
+                    # this should never happen, something is wrong
+                    # with the CSR if we receive this message
                     logger.warning("unexpected service type: %s" % service_type)
                     continue
 
                 if not data or data[0] == b"":
+                    # if there is no data in the message, then we have
+                    # no peers to connect to, normal operation will
+                    # have to wait for the peer(s) to come back online
                     logger.critical("got empty service info from CSR")
                     continue
 
@@ -846,42 +849,49 @@ class Vigilante:
         logger.info("process CSR updates stopped: OK")
 
     async def add_service(self, scroll: Scroll) -> None:
-        if scroll not in self.services:
-            logger.debug("adding service: %s", scroll)
+        # check if the service is already registered, which may happen
+        # if the CSR was offline and is back online now
+        if not [s for s in self.services if s.uid == scroll.uid]:
+            logger.info("ADDING SERVICE: %s -- %s", scroll, scroll.uid)
+
             self.services.append(scroll)
 
-        async def coro():
-            return scroll
+            # register expects a coroutine that returns a Scroll instance
+            async def coro():
+                return scroll
 
-        await register(self.ctx, self.config, coro, [self.on_rcv])
+            await register(self.ctx, self.config, coro, [self.on_rcv])
+
+        else:
+            logger.warning("service already registered: %s", scroll)
 
     async def remove_service(self, scroll: Scroll) -> None:
         logger.info("removing service: %s", scroll)
+
         self.services = list(filter(lambda s: s.uid != scroll.uid, self.services))
+
+        # if we lost connection to the CSR, we need to register again
         if scroll.service_type == "Central Configuration Service":
             await self.register_with_service_registry()
 
     async def register_with_service_registry(self) -> Scroll | None:
+        """Register with the Central Service Registry (Amanya)"""
+
         if not self.config.rgstr_with or "csr" not in self.config.rgstr_with:
             logger.warning("registering with service registry not configured")
             return None
 
-        if self.config.service_registry is None:
-            logger.critical(
-                "unable to register with Central Service Registry , "
-                "missing service registry infomation"
-            )
-            return None
-
         logger.debug("Starting registration with CSR...")
 
+        # register and try forever or until successful
         scroll = await register(
             ctx=self.ctx,
             config=self.config,
             rgstr_info_coro=self.bootstrap,
             actions=[],
-            try_forever=True
+            try_forever=True,
         )
 
         await self.on_rcv(scroll)
+        logger.info("registered with CSR: OK")
         return scroll

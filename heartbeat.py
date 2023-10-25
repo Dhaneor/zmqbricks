@@ -497,21 +497,23 @@ class Hjarta:
         """
         try:
             self.rcv_sock.connect(endpoint)
-            logger.info('Started listening to %s: OK', endpoint)
         except zmq.ZMQError as e:
             logger.error("ZMQ error: %s", e)
         except Exception as e:
             logger.error("unexpected error: %s", e)
+        else:
+            logger.info('Listening to %s: OK', endpoint)
 
     async def stop_listening_to(self, endpoint: str) -> None:
         # self.rcv_sock.setsockopt(zmq.UNSUBSCRIBE, DEFAULT_PUB_TOPIC.encode())
         try:
             self.rcv_sock.disconnect(endpoint)
-            logger.info('Stopped listening to %s: OK', endpoint)
         except zmq.ZMQError as e:
             logger.error("ZMQ error: %s", e)
         except Exception as e:
             logger.error("unexpected error: %s", e)
+        else:
+            logger.info('Stopped listening to %s: OK', endpoint)
 
     async def add_hb_sender(self, kinsman: KinsmanT) -> None:
         """Add a new sender to the Hjarta instance.

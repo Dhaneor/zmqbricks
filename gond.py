@@ -60,6 +60,7 @@ class Gond:
         self.config = config
         self.tasks: list = []
 
+        # initialize peer registry & heartbeat classs
         self.kinsfolk = kf.Kinsfolk(config.hb_interval, config.hb_liveness)
         self.heart = hb.Hjarta(ctx, config, on_rcv=[self.kinsfolk.update])
 
@@ -68,6 +69,7 @@ class Gond:
         on_rgstr_success = [send_rgstr_reply, self.heart.add_hb_sender]
         on_rgstr_success.extend(list(kwargs.get("on_rgstr_success", [])))
 
+        # initialize registration class
         self.vigilante = rgstr.Vigilante(
             ctx=ctx,
             config=config,
@@ -75,6 +77,8 @@ class Gond:
             on_rcv=partial(self.kinsfolk.accept, on_success=on_rgstr_success),
         )
 
+        # set actions to perform if we stop receiving heartbeats
+        # from a connected peer
         self.kinsfolk.on_inactive_kinsman = [
             self.heart.remove_hb_sender, self.vigilante.remove_service
         ]
@@ -88,7 +92,7 @@ class Gond:
         loop = asyncio.get_event_loop()
         loop.set_exception_handler(exc_handler)
 
-        # start heartbeat & registration background tasks
+        # start heartbeat, registration & kinsfolk background tasks
         self.tasks = [
             create_task(self.heart.start(), name="heartbeats"),
             create_task(self.vigilante.start(), name="registration"),
@@ -112,17 +116,15 @@ class Gond:
     async def rgstr_bootstrap(self) -> NamedTuple:
         """Return static registration information for the Central Service Registry.
 
-        Takes the information about the central service registry from
-        the provided configuration file and returns a NamedTuple that
-        replaces the Scroll class that would normally be used for
-        registrations.
+        Takes the information about the central service registry
+        from the provided configuration and returns a NamedTuple
+        tht replaces the Scroll class that would normally be used
+        for registrations.
 
-        Parameters
-        ----------
-        servive_registry: dict
-            The central service registry information, must contain:
-            - endpoint: the endpoint of the central service registry
-            - public_key: the public key of the central service registry
+        Returns
+        -------
+        NamedTuple
+            the information needed to register with the CSR
         """
 
         class StaticRegistrationInfo(NamedTuple):

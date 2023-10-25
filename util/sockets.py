@@ -62,7 +62,7 @@ def socket_type(socket: zmq.Socket) -> str:
 
 
 async def get_random_server_socket(name: str, type: SocketType, config: ConfigT) -> SockT:
-    context = zmq.Context.instance()
+    context = zmq.asyncio.Context.instance()
     socket = context.socket(type)
 
     if config.encrypt:
@@ -70,7 +70,7 @@ async def get_random_server_socket(name: str, type: SocketType, config: ConfigT)
         socket.curve_secretkey = config.private_key.encode("ascii")
         socket.curve_server = True
 
-    socket.setsockopt(zmq.LINGER, 0)
+    # socket.setsockopt(zmq.LINGER, 0)
     socket.bind("tcp://*:0")  # bind to random port
 
     port = socket.getsockopt(zmq.LAST_ENDPOINT).decode().split(":")[-1]

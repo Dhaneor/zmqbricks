@@ -29,7 +29,7 @@ from .registration import Scroll, ScrollT
 from .exceptions import BadScrollError
 
 logger = logging.getLogger("main.kinsfolk")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 CallbacksT = TypeVar("CallbacksT", bound=Sequence[Coroutine[Any, Any, None]])
 
@@ -303,7 +303,7 @@ class Kinsfolk:
                 if not on_success:
                     logger.warning("===> NO CALLBACK ACTIONS configured! <===")
                 for coro in on_success or []:
-                    logger.debug("calling callback: %s", coro)
+                    logger.debug("===> CALLBACK: %s <===", coro)
                     await coro(scroll)
             else:
                 logger.warning("Kinsman %s already in Kinsfolk" % kinsman)

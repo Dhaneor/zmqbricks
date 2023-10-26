@@ -136,7 +136,7 @@ class Kinsfolk:
         self,
         hb_interval_seconds: int,
         hb_liveness: int,
-        on_inactive_kinsman: Optional[Coroutine] = None,
+        on_inactive_kinsman: Optional[Sequence[Coroutine]] = None,
         grace_period: int = 86400,
     ) -> None:
         """Initialize the Kinsfolk.
@@ -147,16 +147,17 @@ class Kinsfolk:
             heartbeat interval in seconds (for health checks).
         hb_liveness : int
             initial liveness value (for health checks).
+        on_inactive_kinsman : Optional[Sequence[Coroutine]], optional
+            what to call when an inactive kinsman is detected, by default None.
         grace_period : int, optional
             delete inactive kinsman after this period, by default 86400
         """
-        self._kinsfolk: KinsfolkT = {}
+        self._kinsfolk: dict[str, KinsmanT] = {}
 
         self.hb_interval_seconds = hb_interval_seconds
         self.hb_liveness = hb_liveness
         self.grace_period = grace_period
-
-        self.on_inactive_kinsman: Optional[Coroutine] = on_inactive_kinsman
+        self.on_inactive_kinsman = on_inactive_kinsman or []
 
     def __contains__(self, identity: str) -> bool:
         return identity in self._kinsfolk
@@ -298,15 +299,13 @@ class Kinsfolk:
             logger.error(f"unexpected error creating a Kinsman: {e}")
             raise BadScrollError() from e
         else:
-            if kinsman.identity not in self.active_kinsmen:
-                await self.add(kinsman)
-                if not on_success:
-                    logger.warning("===> NO CALLBACK ACTIONS configured! <===")
-                for coro in on_success or []:
-                    logger.debug("===> CALLBACK: %s <===", coro)
-                    await coro(scroll)
-            else:
-                logger.warning("Kinsman %s already in Kinsfolk" % kinsman)
+            await self.add(kinsman)
+
+        for coro in on_success or []:
+            try:
+                await coro(scroll)
+            except Exception as e:
+                logger.error("callback  error in %s -->  %s", coro.__name__, e)
 
         return True
 
@@ -349,7 +348,7 @@ class Kinsfolk:
         kinsman.status = "inactive"
 
         if self.on_inactive_kinsman:
-            for coro in self.on_inactive_kinsman or []:
+            for coro in self.on_inactive_kinsman:
                 asyncio.create_task(coro(kinsman.to_scroll()))
 
         return False

@@ -38,6 +38,7 @@ from . import kinsfolk as kf
 from . import registration as rgstr
 from . import heartbeat as hb
 from . import base_config as cnf
+from .util.sockets import get_random_server_socket
 
 logger = logging.getLogger("main.gond")
 
@@ -60,34 +61,44 @@ class Gond:
         self.config = config
         self.tasks: list = []
 
-        # initialize peer registry & heartbeat classs
-        self.kinsfolk = kf.Kinsfolk(config.hb_interval, config.hb_liveness)
-        self.heart = hb.Hjarta(ctx, config, on_rcv=[self.kinsfolk.update])
+        self.kinsfolk: kf.Kinsfolk
+        self.vigilante: rgstr.Vigilante
+        self.heart: hb.Hjarta
 
-        # prepare actions to perform after successful registration
-        send_rgstr_reply = partial(rgstr.send_reply_ok, config=self.config)
-        on_rgstr_success = [send_rgstr_reply, self.heart.add_hb_sender]
-        on_rgstr_success.extend(list(kwargs.get("on_rgstr_success", [])))
-
-        # initialize registration class
-        self.vigilante = rgstr.Vigilante(
-            ctx=ctx,
-            config=config,
-            bootstrap=self.rgstr_bootstrap,
-            on_rcv=partial(self.kinsfolk.accept, on_success=on_rgstr_success),
-        )
-
-        # set actions to perform if we stop receiving heartbeats
-        # from a connected peer
-        self.kinsfolk.on_inactive_kinsman = [
-            self.heart.remove_hb_sender, self.vigilante.remove_service
-        ]
+        self.on_rgstr_success: list = kwargs.get("on_rgstr_success", [])
 
     def __repr__(self) -> str:
         return f"Gond(config={vars(self.config)})"
 
     async def __aenter__(self):
         logger.info("Starting components...")
+
+        ctx = zmq.asyncio.Context.instance()
+
+        # this creates the sockets & updates the config with new values
+        # for their endpoints
+        await get_random_server_socket("registration", zmq.ROUTER, self.config)
+        await get_random_server_socket("heartbeat", zmq.PUB, self.config)
+
+        # initialize peer registry & heartbeat classs
+        self.kinsfolk = kf.Kinsfolk(self.config.hb_interval, self.config.hb_liveness)
+        self.heart = hb.Hjarta(ctx, self.config, on_rcv=[self.kinsfolk.update])
+
+        # prepare actions to perform after successful registration
+        send_rgstr_reply = partial(rgstr.send_reply_ok, config=self.config)
+        on_rgstr_success = [send_rgstr_reply, self.heart.add_hb_sender]
+        on_rgstr_success.extend(self.on_rgstr_success)
+
+        # initialize registration class
+        on_rcv = partial(self.kinsfolk.accept, on_success=on_rgstr_success)
+        self.vigilante = rgstr.Vigilante(
+            config=self.config, bootstrap=self.rgstr_bootstrap, on_rcv=on_rcv
+        )
+
+        # set actions to perform if we stop receiving heartbeats
+        # from a connected peer
+        on_inactive = [self.heart.remove_hb_sender, self.vigilante.remove_service]
+        self.kinsfolk.on_inactive_kinsman = on_inactive
 
         loop = asyncio.get_event_loop()
         loop.set_exception_handler(exc_handler)

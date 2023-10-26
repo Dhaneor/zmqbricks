@@ -660,15 +660,12 @@ class Vigilante:
     """
 
     def __init__(
-        self, ctx: ContextT, config: ConfigT, bootstrap: Coroutine, on_rcv: Coroutine
+        self, config: ConfigT, bootstrap: Coroutine, on_rcv: Coroutine
     ) -> None:
         """Initialize the Rawi (registration) instance.
 
         Parameters
         ----------
-        ctx : ContextT
-            Currently active (async) ZeroMQ context
-
         config : ConfigT
             The component configuration object
 
@@ -680,7 +677,7 @@ class Vigilante:
         on_rcv : Coroutine
             Action to perform after a peer registered with this component.
         """
-        self.ctx = ctx
+        self.ctx = zmq.asyncio.Context.instance()
         self.config = config
         self.bootstrap = bootstrap
         self.on_rcv = on_rcv

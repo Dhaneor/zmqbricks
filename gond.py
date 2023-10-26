@@ -32,7 +32,7 @@ import zmq.asyncio
 
 from asyncio import create_task
 from functools import partial
-from typing import TypeVar, NamedTuple
+from typing import TypeVar, NamedTuple, Coroutine
 
 from . import kinsfolk as kf
 from . import registration as rgstr
@@ -57,15 +57,15 @@ class Gond:
     This is to be used as a context manager!
     """
 
-    def __init__(self, config: ConfigT, ctx: ContextT, **kwargs) -> None:
+    def __init__(self, config: ConfigT, on_rgstr_success: list[Coroutine]) -> None:
         self.config = config
-        self.tasks: list = []
+        self.on_rgstr_success = on_rgstr_success or []
 
         self.kinsfolk: kf.Kinsfolk
         self.vigilante: rgstr.Vigilante
         self.heart: hb.Hjarta
 
-        self.on_rgstr_success: list = kwargs.get("on_rgstr_success", [])
+        self.tasks: list = []
 
     def __repr__(self) -> str:
         return f"Gond(config={vars(self.config)})"
@@ -73,12 +73,38 @@ class Gond:
     async def __aenter__(self):
         logger.info("Starting components...")
 
-        ctx = zmq.asyncio.Context.instance()
+        # set exception handler for unhandled exceptions
+        loop = asyncio.get_event_loop()
+        loop.set_exception_handler(exc_handler)
 
+        await self.initialize_sockets()
+        await self.initialize_components()
+        await self.create_background_tasks()
+
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        logger.info("Stopping components...")
+
+        await self.vigilante.stop()
+        await self.heart.stop()
+
+        for task in self.tasks:
+            logger.debug("cancelling task: %s" % task.get_name())
+            task.cancel()
+
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+
+    async def initialize_sockets(self) -> None:
+        """Create the sockets for the components."""
         # this creates the sockets & updates the config with new values
         # for their endpoints
         await get_random_server_socket("registration", zmq.ROUTER, self.config)
         await get_random_server_socket("heartbeat", zmq.PUB, self.config)
+
+    async def initialize_components(self) -> None:
+        """Initialize Kinsfolk, Vigilante, and Heartbeat components."""
+        ctx = zmq.asyncio.Context.instance()
 
         # initialize peer registry & heartbeat classs
         self.kinsfolk = kf.Kinsfolk(self.config.hb_interval, self.config.hb_liveness)
@@ -100,29 +126,13 @@ class Gond:
         on_inactive = [self.heart.remove_hb_sender, self.vigilante.remove_service]
         self.kinsfolk.on_inactive_kinsman = on_inactive
 
-        loop = asyncio.get_event_loop()
-        loop.set_exception_handler(exc_handler)
-
-        # start heartbeat, registration & kinsfolk background tasks
+    async def create_background_tasks(self) -> None:
+        """Start heartbeat, registration & kinsfolk background tasks."""
         self.tasks = [
             create_task(self.heart.start(), name="heartbeats"),
             create_task(self.vigilante.start(), name="registration"),
             create_task(self.kinsfolk.watch_out(), name="kinsfolk"),
         ]
-
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        logger.info("Stopping components...")
-
-        await self.vigilante.stop()
-        await self.heart.stop()
-
-        for task in self.tasks:
-            logger.debug("cancelling task: %s" % task.get_name())
-            task.cancel()
-
-        await asyncio.gather(*self.tasks, return_exceptions=True)
 
     async def rgstr_bootstrap(self) -> NamedTuple:
         """Return static registration information for the Central Service Registry.

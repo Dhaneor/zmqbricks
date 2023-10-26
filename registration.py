@@ -160,8 +160,6 @@ class Scroll:
 
         msg_encoded = json.dumps(as_dict).encode()
 
-        logger.debug("sending scroll: %s", msg_encoded)
-
         # send it (with routing key if socket is a ROUTER socket)
         if not routing_key:
             await socket.send(msg_encoded)

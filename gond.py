@@ -32,7 +32,7 @@ import zmq.asyncio
 
 from asyncio import create_task
 from functools import partial
-from typing import TypeVar, NamedTuple, Coroutine
+from typing import TypeVar, NamedTuple, Coroutine, Optional
 
 from . import kinsfolk as kf
 from . import registration as rgstr
@@ -57,7 +57,21 @@ class Gond:
     This is to be used as a context manager!
     """
 
-    def __init__(self, config: ConfigT, on_rgstr_success: list[Coroutine]) -> None:
+    def __init__(
+        self,
+        config: ConfigT,
+        on_rgstr_success: Optional[list[Coroutine]] = None
+    ) -> None:
+        """Initialize the Gond class.
+
+        Parameters
+        ----------
+        config : ConfigT
+            A configuration object
+        on_rgstr_success : Optional[list[Coroutine]], optional
+           Additional actions to perform after successful registration
+           of a peer component, by default None
+        """
         self.config = config
         self.on_rgstr_success = on_rgstr_success or []
 
@@ -97,6 +111,10 @@ class Gond:
 
     async def initialize_sockets(self) -> None:
         """Create the sockets for the components."""
+        # CSR has a static address/ports - so, don't change it here
+        if self.config.service_type == "Central Configuration Service":
+            return
+
         # this creates the sockets & updates the config with new values
         # for their endpoints
         await get_random_server_socket("registration", zmq.ROUTER, self.config)

@@ -62,6 +62,24 @@ def socket_type(socket: zmq.Socket) -> str:
 
 
 async def get_random_server_socket(name: str, type: SocketType, config: ConfigT) -> SockT:
+    """Get a server socket with a random port.
+
+    The provided config object will be updated with a new endpoint/address.
+
+    Parameters
+    ----------
+    name : str
+        Arbitrary socket name (will be used as a key in config.endpoints)
+    type : SocketType
+        A ZeroMQ socket type
+    config : ConfigT
+        A configuration object
+
+    Returns
+    -------
+    SockT
+        A ZMQ socket
+    """
     context = zmq.asyncio.Context.instance()
     socket = context.socket(type)
 

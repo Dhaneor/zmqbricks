@@ -9,7 +9,7 @@ Note: Wonder about kinsman/kinsfolk? According to Merriam-Webster:
 
 Classes:
     Kinsman
-        a dataclass representing a kinsman
+        A dataclass representing a kinsman
 
     Kinsfolk
         A registry that keeps track of connected kinsmen.

@@ -52,7 +52,7 @@ class BaseConfig:
         exchange: Optional[str] = "all",
         markets: Optional[Sequence[str]] = ["all"],
         service_type: Optional[str] = "generic",
-        sock_defs: Sequence[SockDef] = [],
+        sock_defs: Sequence[SockDef] = None,
         **kwargs
     ) -> None:
         self.uid: str = str(uuid4())

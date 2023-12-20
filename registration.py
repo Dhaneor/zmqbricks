@@ -638,8 +638,6 @@ async def monitor_registration(
 class Vigilante:
     """Class that manages registrations for peer kinsman.
 
-    rawi --> Arabic for registry
-
     Parameters
     ----------
     ctx : ContextT
@@ -756,6 +754,13 @@ class Vigilante:
         logger.debug("CSR agent initialized: OK")
 
     async def monitor_updates(self, csr_scroll: ScrollT) -> None:
+        """Monitors the updates from the Central Service Registry (Amanya)
+
+        Parameters
+        ----------
+        csr_scroll : ScrollT
+            Scroll instance from the Central Service Registry (Amanya)
+        """
         # configure subscriber socket
         public_key, private_key = generate_curve_key_pair()
         csr_monitor = self.ctx.socket(zmq.SUB)
